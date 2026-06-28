@@ -90,7 +90,6 @@ class LebedKAPMLogMod(loader.Module):
         "strings_ru": strings_ru,
     }
 
-    # Old module names that should be migrated to the current one
     _old_names = ["Apo PMLogger", "Apo-PMLog"]
 
     def __init__(self):
@@ -186,7 +185,7 @@ class LebedKAPMLogMod(loader.Module):
         return await self._topic_cacher(user)
 
     async def _topic_handler(self, user: User, message: Message):
-        if not await self._topic_cacher(user):  # create topic if not exists
+        if not await self._topic_cacher(user):
             await self._topic_creator(user)
         new_title = f"{user.first_name} ({user.id})"
         if (
@@ -262,22 +261,37 @@ class LebedKAPMLogMod(loader.Module):
             f"🔥 <b>Self-destructive message</b> (TTL: <code>{ttl}s</code>)\n"
         )
 
-        if message.file:
-            file = BytesIO()
-            await self._client.download_file(message, file)
-            file.name = (
-                message.file.name
-                or f"ttl_{ttl}{message.file.ext or ''}"
-            )
-            file.seek(0)
-            caption = header + utils.escape_html(message.text or "")
-            msg = await self._client.send_file(
-                self.c.id,
-                file,
-                force_document=True,
-                caption=caption,
-                reply_to=topic_id,
-            )
+        media = getattr(message, "media", None)
+        if media is not None:
+            with contextlib.suppress(Exception):
+                media.ttl_seconds = None
+
+            try:
+                file = BytesIO()
+                await self._client.download_media(message.media, file)
+                ext = ""
+                if message.file and message.file.ext:
+                    ext = message.file.ext
+                file.name = (
+                    (message.file.name if message.file else None)
+                    or f"ttl_{ttl}{ext}"
+                )
+                file.seek(0)
+                caption = header + utils.escape_html(message.text or "")
+                msg = await self._client.send_file(
+                    self.c.id,
+                    file,
+                    force_document=True,
+                    caption=caption,
+                    reply_to=topic_id,
+                )
+            except Exception:
+                text = utils.escape_html(message.text or message.raw_text or "")
+                msg = await self._client.send_message(
+                    self.c.id,
+                    header + text + "\n\n<i>⚠️ Failed to download media</i>",
+                    reply_to=topic_id,
+                )
         else:
             text = utils.escape_html(message.text or message.raw_text or "")
             msg = await self._client.send_message(
@@ -307,10 +321,6 @@ class LebedKAPMLogMod(loader.Module):
             return
         try:
             if await self._topic_handler(user, message):
-                # Self-destructive (TTL) media/messages must be downloaded
-                # and re-sent as regular files, otherwise they either fail
-                # to forward (MessageIdInvalidError) or keep their TTL and
-                # disappear from the log chat as well.
                 if self.config["log_self_destr"] and self._is_self_destructive(
                     message
                 ):
@@ -322,7 +332,7 @@ class LebedKAPMLogMod(loader.Module):
                 )
                 await self._mark_topic_read(msg)
         except MessageIdInvalidError:
-            if not message.file or not self.config["log_self_destr"]:
+            if not self.config["log_self_destr"]:
                 return
             await self._save_self_destructive(user, message)
 
