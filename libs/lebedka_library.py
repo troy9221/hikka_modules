@@ -357,7 +357,7 @@ class ApodiktumControllerLoader(loader.Module):
         """
         Downloads the Apo-LibController from GitHub
         """
-        link = "https://raw.githubusercontent.com/anon97945/hikka-mods/master/apolib_controller.py"
+        link = "https://raw.githubusercontent.com/troy9221/hikka_modules/main/libs/lebedka_controller.py"
         async with aiohttp.ClientSession() as session, session.head(link) as response:
             if response.status >= 300:
                 return None
