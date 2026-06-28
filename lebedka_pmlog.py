@@ -150,7 +150,7 @@ class LebedKAPMLogMod(loader.Module):
 
     async def client_ready(self):
         self.lebedka_lib = await self.import_lib(
-            "https://raw.githubusercontent.com/troy9221/hikka_modules/main/lebedka_library.py",
+            "https://raw.githubusercontent.com/troy9221/hikka_modules/main/libs/lebedka_library.py",
             suspend_on_error=True,
         )
         await self.lebedka_lib.migrator.auto_migrate_handler(
