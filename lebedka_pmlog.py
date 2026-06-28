@@ -11,12 +11,10 @@
 # scope: hikka_only
 # scope: hikka_min 1.3.3
 
-import contextlib
 import logging
 from datetime import datetime
 from io import BytesIO
 
-from telethon.errors import MessageIdInvalidError
 from telethon.tl.types import Message, User
 
 from telethon.tl.functions.messages import (
@@ -245,7 +243,9 @@ class LebedKAPMLogMod(loader.Module):
             )
         )
 
-    async def _save_self_destructive(self, user: User, message: Message):
+    async def _save_self_destructive(
+        self, user: User, message: Message, downloaded_media=None
+    ):
         """
         Downloads self-destructive media and sends it to the log chat as a
         regular document (without TTL), so it won't disappear from the log.
@@ -263,12 +263,12 @@ class LebedKAPMLogMod(loader.Module):
 
         media = getattr(message, "media", None)
         if media is not None:
-            with contextlib.suppress(Exception):
-                media.ttl_seconds = None
-
             try:
-                file = BytesIO()
-                await self._client.download_media(message.media, file)
+                if downloaded_media is not None:
+                    file = downloaded_media
+                else:
+                    file = BytesIO()
+                    await self._client.download_media(message, file=file)
                 ext = ""
                 if message.file and message.file.ext:
                     ext = message.file.ext
@@ -285,7 +285,8 @@ class LebedKAPMLogMod(loader.Module):
                     caption=caption,
                     reply_to=topic_id,
                 )
-            except Exception:
+            except Exception as e:
+                logger.exception("Failed to download self-destructive media: %s", e)
                 text = utils.escape_html(message.text or message.raw_text or "")
                 msg = await self._client.send_message(
                     self.c.id,
@@ -319,25 +320,43 @@ class LebedKAPMLogMod(loader.Module):
             and not chatidindb
         ):
             return
+        is_self_destr = self._is_self_destructive(message)
+        downloaded_media = None
+        if is_self_destr and self.config["log_self_destr"]:
+            try:
+                buf = BytesIO()
+                await self._client.download_media(message, file=buf)
+                buf.seek(0)
+                downloaded_media = buf
+            except Exception as e:
+                logger.exception("Failed to download self-destructive media: %s", e)
+
         try:
             if await self._topic_handler(user, message):
-                if self.config["log_self_destr"] and self._is_self_destructive(
-                    message
-                ):
-                    await self._save_self_destructive(user, message)
+                if is_self_destr:
+                    if self.config["log_self_destr"]:
+                        await self._save_self_destructive(
+                            user, message, downloaded_media
+                        )
                     return
 
                 msg = await message.forward_to(
                     self.c.id, top_msg_id=self._topic_cache[user.id].id
                 )
                 await self._mark_topic_read(msg)
-        except MessageIdInvalidError:
+        except Exception as e:
             if not self.config["log_self_destr"]:
+                logger.debug("Skipping self-destructive message (logging disabled): %s", e)
                 return
-            await self._save_self_destructive(user, message)
+            if is_self_destr:
+                await self._save_self_destructive(user, message, downloaded_media)
+            else:
+                logger.exception("Failed to forward message: %s", e)
 
     @loader.watcher(only_messages=True)
     async def watcher(self, message: Message):
         """Intercepts all incoming messages and logs PMs."""
-        with contextlib.suppress(Exception):
+        try:
             await self._queue_handler(message)
+        except Exception as e:
+            logger.exception("PMLog watcher error: %s", e)
