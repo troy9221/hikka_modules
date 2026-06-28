@@ -11,6 +11,7 @@
 # scope: hikka_only
 # scope: hikka_min 1.3.3
 
+import contextlib
 import logging
 from datetime import datetime
 from io import BytesIO
@@ -53,7 +54,6 @@ class LebedKAPMLogMod(loader.Module):
         ),
         "_cfg_realtime_usernames": "Whether to update the topic names in realtime or not.",
         "_cfg_mark_read": "Whether to mark the messages in the log as read or not.",
-        "_cfg_auto_migrate": "Whether to auto migrate defined changes on startup.",
     }
 
     strings_en = {}
@@ -90,17 +90,12 @@ class LebedKAPMLogMod(loader.Module):
         "strings_ru": strings_ru,
     }
 
-    changes = {
-        "migration1": {
-            "name": {
-                "old": "Apo PMLogger",
-                "new": "LebedKA-PMLog",
-            },
-        },
-    }
+    # Old module names that should be migrated to the current one
+    _old_names = ["Apo PMLogger", "Apo-PMLog"]
 
     def __init__(self):
         self._ratelimit = []
+        self._topic_cache = {}
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
                 "log_bots",
@@ -140,26 +135,9 @@ class LebedKAPMLogMod(loader.Module):
                 doc=lambda: self.strings("_cfg_mark_read"),
                 validator=loader.validators.Boolean(),
             ),
-            loader.ConfigValue(
-                "auto_migrate",
-                True,
-                doc=lambda: self.strings("_cfg_auto_migrate"),
-                validator=loader.validators.Boolean(),
-            ),  # for MigratorClass
         )
 
     async def client_ready(self):
-        self.lebedka_lib = await self.import_lib(
-            "https://raw.githubusercontent.com/troy9221/hikka_modules/main/libs/lebedka_library.py",
-            suspend_on_error=True,
-        )
-        await self.lebedka_lib.migrator.auto_migrate_handler(
-            self.__class__.__name__,
-            self.strings("name"),
-            self.changes,
-            self.config["auto_migrate"],
-        )
-        self.lebedka_lib.watcher_q.register(self.__class__.__name__)
         self._topic_cache = {}
         self.c, _ = await utils.asset_channel(
             self._client,
@@ -170,9 +148,6 @@ class LebedKAPMLogMod(loader.Module):
         )
         if not self.c.forum:
             await self._client(ToggleForumRequest(self.c.id, True))
-
-    async def on_unload(self):
-        self.lebedka_lib.watcher_q.unregister(self.__class__.__name__)
 
     async def cpmlogcmd(self, message: Message):
         """
@@ -191,7 +166,7 @@ class LebedKAPMLogMod(loader.Module):
                     offset_date=datetime.now(),
                     offset_id=0,
                     offset_topic=0,
-                    limit=0,
+                    limit=100,
                 )
             )
             for topic in forum.topics:
@@ -314,15 +289,6 @@ class LebedKAPMLogMod(loader.Module):
         await self._mark_topic_read(msg)
         return msg
 
-    async def q_watcher(self, message: Message):
-        try:
-            await self._queue_handler(message)
-        except Exception as exc:  # skipcq: PYL-W0703
-            if "topic was deleted" in str(exc):
-                self._topic_cache.pop(utils.get_chat_id(message))
-                await self._queue_handler(message)
-                return
-
     async def _queue_handler(self, message: Message):
         if not isinstance(message, Message) or not message.is_private:
             return
@@ -359,3 +325,9 @@ class LebedKAPMLogMod(loader.Module):
             if not message.file or not self.config["log_self_destr"]:
                 return
             await self._save_self_destructive(user, message)
+
+    @loader.watcher(only_messages=True)
+    async def watcher(self, message: Message):
+        """Intercepts all incoming messages and logs PMs."""
+        with contextlib.suppress(Exception):
+            await self._queue_handler(message)
