@@ -37,7 +37,7 @@ Hikka-модуль для логирования личных сообщений
 
 ## Лицензия
 
-🔒 Licensed under the [GNU GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)
+🔒 Licensed under the [GNU GPLv3](LICENSE)
 
 ## Автор
 
