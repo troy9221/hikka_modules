@@ -7,6 +7,7 @@
 # scope: hikka_only
 # scope: hikka_min 1.3.3
 
+import asyncio
 import logging
 from datetime import datetime
 from io import BytesIO
@@ -141,6 +142,7 @@ class LebedKAPMLogMod(loader.Module):
         self._ratelimit = []
         self._topic_cache = {}
         self._group_topic_cache = {}
+        self._topic_locks = {}
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
                 "log_bots",
@@ -191,6 +193,7 @@ class LebedKAPMLogMod(loader.Module):
     async def client_ready(self):
         self._topic_cache = {}
         self._group_topic_cache = {}
+        self._topic_locks = {}
         self.c, _ = await utils.asset_channel(
             self._client,
             "[LebedKA] PMLog",
@@ -366,6 +369,15 @@ class LebedKAPMLogMod(loader.Module):
             or "Unknown"
         )
 
+    def _get_topic_lock(self, channel, user_id: int) -> asyncio.Lock:
+        """Returns a per-(channel, id) lock to serialize topic creation."""
+        key = (channel.id, user_id)
+        lock = self._topic_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._topic_locks[key] = lock
+        return lock
+
     async def _topic_cacher(self, user: User, channel, cache: dict):
         if user.id not in cache:
             forum = await self._client(
@@ -384,6 +396,10 @@ class LebedKAPMLogMod(loader.Module):
         return user.id in cache
 
     async def _topic_creator(self, user: User, channel, cache: dict):
+        # Re-check the cache in case another coroutine created the topic
+        # while we were waiting for the lock, to avoid duplicate topics.
+        if await self._topic_cacher(user, channel, cache):
+            return True
         await self._client(
             CreateForumTopicRequest(
                 channel=channel.id,
@@ -391,11 +407,13 @@ class LebedKAPMLogMod(loader.Module):
                 icon_color=42,
             )
         )
+        cache.pop(user.id, None)
         return await self._topic_cacher(user, channel, cache)
 
     async def _topic_handler(self, user: User, message: Message, channel, cache: dict):
-        if not await self._topic_cacher(user, channel, cache):
-            await self._topic_creator(user, channel, cache)
+        async with self._get_topic_lock(channel, user.id):
+            if not await self._topic_cacher(user, channel, cache):
+                await self._topic_creator(user, channel, cache)
         new_title = f"{self._entity_name(user)} ({user.id})"
         if (
             self.config["realtime_names"]
