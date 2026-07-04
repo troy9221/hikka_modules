@@ -55,8 +55,12 @@ class LebedKAPMLogMod(loader.Module):
             " notice about it."
         ),
         "_cfg_mark_read": "👁 Mark logged messages as read in the log chat.",
-        "_cmd_doc_pmlogadd": "Add a chat/user id to the log list (reply, id or current chat).",
-        "_cmd_doc_pmlogdel": "Remove a chat/user id from the log list (reply, id or current chat).",
+        "_cfg_loggroups": (
+            "👥 Also log group/supergroup chats that are added to the list"
+            " above (by default only private chats are logged)."
+        ),
+        "_cmd_doc_pmlogadd": "Add chat/user id(s) to the log list (reply, id(s) or current chat).",
+        "_cmd_doc_pmlogdel": "Remove chat/user id(s) from the log list (reply, id(s) or current chat).",
         "_cmd_doc_pmloglist": "Show the current log list.",
         "no_id": "🚫 <b>Could not determine the id. Reply to a message, pass an id or run in the target chat.</b>",
         "added": "✅ <b>Id</b> <code>{}</code> <b>added to the log list.</b>",
@@ -105,9 +109,13 @@ class LebedKAPMLogMod(loader.Module):
             " этом уведомление."
         ),
         "_cfg_mark_read": "👁 Отмечать залогированные сообщения прочитанными в чате лога.",
+        "_cfg_loggroups": (
+            "👥 Логировать также группы/супергруппы, добавленные в список выше"
+            " (по умолчанию логируются только личные чаты)."
+        ),
         "_cmd_doc_cpmlog": "Это откроет конфиг для модуля.",
-        "_cmd_doc_pmlogadd": "Добавить id чата/пользователя в список логирования (реплай, id или текущий чат).",
-        "_cmd_doc_pmlogdel": "Удалить id чата/пользователя из списка логирования (реплай, id или текущий чат).",
+        "_cmd_doc_pmlogadd": "Добавить id чатов/пользователей в список логирования (реплай, id через пробел/запятую или текущий чат).",
+        "_cmd_doc_pmlogdel": "Удалить id чатов/пользователей из списка логирования (реплай, id через пробел/запятую или текущий чат).",
         "_cmd_doc_pmloglist": "Показать текущий список логирования.",
         "no_id": "🚫 <b>Не удалось определить id. Ответьте на сообщение, укажите id или запустите в нужном чате.</b>",
         "added": "✅ <b>Id</b> <code>{}</code> <b>добавлен в список логирования.</b>",
@@ -171,6 +179,12 @@ class LebedKAPMLogMod(loader.Module):
                 doc=lambda: self.strings("_cfg_mark_read"),
                 validator=loader.validators.Boolean(),
             ),
+            loader.ConfigValue(
+                "log_groups",
+                False,
+                doc=lambda: self.strings("_cfg_loggroups"),
+                validator=loader.validators.Boolean(),
+            ),
         )
 
     async def client_ready(self):
@@ -194,55 +208,95 @@ class LebedKAPMLogMod(loader.Module):
             await utils.answer(message, f"{self.get_prefix()}config {name}")
         )
 
-    async def _resolve_target_id(self, message: Message):
+    async def _resolve_target_ids(self, message: Message):
         args = utils.get_args_raw(message)
         if args:
-            try:
-                return int(args)
-            except ValueError:
+            raw_ids = [
+                part
+                for part in args.replace(",", " ").split()
+                if part
+            ]
+            targets = []
+            for part in raw_ids:
                 try:
-                    entity = await self._client.get_entity(args)
-                    return entity.id
-                except Exception:
-                    return None
+                    targets.append(int(part))
+                except ValueError:
+                    try:
+                        entity = await self._client.get_entity(part)
+                        targets.append(entity.id)
+                    except Exception:
+                        continue
+            return targets
         reply = await message.get_reply_message()
         if reply:
-            return reply.sender_id
+            return [reply.sender_id]
         if message.is_private:
-            return utils.get_chat_id(message)
-        return None
+            return [utils.get_chat_id(message)]
+        return []
 
     async def pmlogaddcmd(self, message: Message):
         """
-        Add a chat/user id to the log list (reply, id or current chat).
+        Add chat/user id(s) to the log list (reply, id(s) or current chat).
         """
-        target = await self._resolve_target_id(message)
-        if target is None:
+        targets = await self._resolve_target_ids(message)
+        if not targets:
             await utils.answer(message, self.strings("no_id"))
             return
         log_list = list(self.config["log_list"] or [])
-        if target in log_list:
-            await utils.answer(message, self.strings("already_added").format(target))
-            return
-        log_list.append(target)
+        added, skipped = [], []
+        for target in targets:
+            if target in log_list:
+                skipped.append(target)
+            else:
+                log_list.append(target)
+                added.append(target)
         self.config["log_list"] = log_list
-        await utils.answer(message, self.strings("added").format(target))
+        lines = []
+        if added:
+            lines.append(
+                self.strings("added").format(
+                    ", ".join(str(i) for i in added)
+                )
+            )
+        if skipped:
+            lines.append(
+                self.strings("already_added").format(
+                    ", ".join(str(i) for i in skipped)
+                )
+            )
+        await utils.answer(message, "\n".join(lines))
 
     async def pmlogdelcmd(self, message: Message):
         """
-        Remove a chat/user id from the log list (reply, id or current chat).
+        Remove chat/user id(s) from the log list (reply, id(s) or current chat).
         """
-        target = await self._resolve_target_id(message)
-        if target is None:
+        targets = await self._resolve_target_ids(message)
+        if not targets:
             await utils.answer(message, self.strings("no_id"))
             return
         log_list = list(self.config["log_list"] or [])
-        if target not in log_list:
-            await utils.answer(message, self.strings("not_in_list").format(target))
-            return
-        log_list.remove(target)
+        removed, missing = [], []
+        for target in targets:
+            if target in log_list:
+                log_list.remove(target)
+                removed.append(target)
+            else:
+                missing.append(target)
         self.config["log_list"] = log_list
-        await utils.answer(message, self.strings("removed").format(target))
+        lines = []
+        if removed:
+            lines.append(
+                self.strings("removed").format(
+                    ", ".join(str(i) for i in removed)
+                )
+            )
+        if missing:
+            lines.append(
+                self.strings("not_in_list").format(
+                    ", ".join(str(i) for i in missing)
+                )
+            )
+        await utils.answer(message, "\n".join(lines))
 
     async def pmloglistcmd(self, message: Message):
         """
@@ -257,9 +311,27 @@ class LebedKAPMLogMod(loader.Module):
             if self.config["whitelist"]
             else self.strings("mode_black")
         )
-        items = "\n".join(f"• <code>{i}</code>" for i in log_list)
+        lines = []
+        for i in log_list:
+            try:
+                entity = await self._client.get_entity(i)
+                name = utils.escape_html(self._entity_name(entity))
+                lines.append(f"• <b>{name}</b> — <code>{i}</code>")
+            except Exception:
+                lines.append(f"• <code>{i}</code>")
+        items = "\n".join(lines)
         await utils.answer(
             message, self.strings("list_header").format(mode, items)
+        )
+
+    @staticmethod
+    def _entity_name(entity) -> str:
+        """Returns a display name for a user (first_name) or a group (title)."""
+        return (
+            getattr(entity, "title", None)
+            or getattr(entity, "first_name", None)
+            or getattr(entity, "username", None)
+            or "Unknown"
         )
 
     async def _topic_cacher(self, user: User):
@@ -274,7 +346,7 @@ class LebedKAPMLogMod(loader.Module):
                 )
             )
             for topic in forum.topics:
-                if str(user.id) in topic.title:
+                if f"({user.id})" in topic.title:
                     self._topic_cache[user.id] = topic
                     break
         return user.id in self._topic_cache
@@ -283,7 +355,7 @@ class LebedKAPMLogMod(loader.Module):
         await self._client(
             CreateForumTopicRequest(
                 channel=self.c.id,
-                title=f"{user.first_name} ({user.id})",
+                title=f"{self._entity_name(user)} ({user.id})",
                 icon_color=42,
             )
         )
@@ -292,7 +364,7 @@ class LebedKAPMLogMod(loader.Module):
     async def _topic_handler(self, user: User, message: Message):
         if not await self._topic_cacher(user):
             await self._topic_creator(user)
-        new_title = f"{user.first_name} ({user.id})"
+        new_title = f"{self._entity_name(user)} ({user.id})"
         if (
             self.config["realtime_names"]
             and self._topic_cache[user.id].title != new_title
@@ -453,20 +525,27 @@ class LebedKAPMLogMod(loader.Module):
         return msg
 
     async def _queue_handler(self, message: Message):
-        if not isinstance(message, Message) or not message.is_private:
+        if not isinstance(message, Message):
             return
-        user = await message.get_sender()
-        if user.id == self.tg_id:
-            user = await message.get_chat()
-        if (user.bot and not self.config["log_bots"]) or user.id == self.tg_id:
-            return
+
         chatidindb = utils.get_chat_id(message) in (self.config["log_list"] or [])
-        if (
-            self.config["whitelist"]
-            and chatidindb
-            or not self.config["whitelist"]
-            and not chatidindb
-        ):
+
+        if message.is_private:
+            user = await message.get_sender()
+            if user.id == self.tg_id:
+                user = await message.get_chat()
+            if (user.bot and not self.config["log_bots"]) or user.id == self.tg_id:
+                return
+            if (
+                self.config["whitelist"]
+                and chatidindb
+                or not self.config["whitelist"]
+                and not chatidindb
+            ):
+                return
+        elif self.config["log_groups"] and chatidindb:
+            user = await message.get_chat()
+        else:
             return
         is_self_destr = self._is_self_destructive(message)
         downloaded_media = None
