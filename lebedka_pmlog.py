@@ -140,6 +140,7 @@ class LebedKAPMLogMod(loader.Module):
     def __init__(self):
         self._ratelimit = []
         self._topic_cache = {}
+        self._group_topic_cache = {}
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
                 "log_bots",
@@ -189,6 +190,7 @@ class LebedKAPMLogMod(loader.Module):
 
     async def client_ready(self):
         self._topic_cache = {}
+        self._group_topic_cache = {}
         self.c, _ = await utils.asset_channel(
             self._client,
             "[LebedKA] PMLog",
@@ -198,6 +200,24 @@ class LebedKAPMLogMod(loader.Module):
         )
         if not self.c.forum:
             await self._client(ToggleForumRequest(self.c.id, True))
+        self.gc = None
+        if self.config["log_groups"]:
+            await self._ensure_group_channel()
+
+    async def _ensure_group_channel(self):
+        """Lazily creates/returns the separate channel used for group logs."""
+        if getattr(self, "gc", None):
+            return self.gc
+        self.gc, _ = await utils.asset_channel(
+            self._client,
+            "[LebedKA] PMLogGroups",
+            "Chat for logged group messages. The ID's in the topic titles are the chat ID's, don't remove them!",
+            silent=True,
+            invite_bot=False,
+        )
+        if not self.gc.forum:
+            await self._client(ToggleForumRequest(self.gc.id, True))
+        return self.gc
 
     async def cpmlogcmd(self, message: Message):
         """
@@ -207,6 +227,20 @@ class LebedKAPMLogMod(loader.Module):
         await self.allmodules.commands["config"](
             await utils.answer(message, f"{self.get_prefix()}config {name}")
         )
+
+    @staticmethod
+    def _normalize_id(chat_id: int) -> int:
+        """
+        Normalizes an id to the same form utils.get_chat_id() returns
+        (positive id without the -100 supergroup/channel prefix), so ids
+        added by the user match ids seen in the watcher.
+        """
+        s = str(chat_id)
+        if s.startswith("-100"):
+            return int(s[4:])
+        if s.startswith("-"):
+            return int(s[1:])
+        return chat_id
 
     async def _resolve_target_ids(self, message: Message):
         args = utils.get_args_raw(message)
@@ -219,20 +253,18 @@ class LebedKAPMLogMod(loader.Module):
             targets = []
             for part in raw_ids:
                 try:
-                    targets.append(int(part))
+                    targets.append(self._normalize_id(int(part)))
                 except ValueError:
                     try:
                         entity = await self._client.get_entity(part)
-                        targets.append(entity.id)
+                        targets.append(self._normalize_id(entity.id))
                     except Exception:
                         continue
             return targets
         reply = await message.get_reply_message()
         if reply:
-            return [reply.sender_id]
-        if message.is_private:
-            return [utils.get_chat_id(message)]
-        return []
+            return [self._normalize_id(reply.sender_id)]
+        return [utils.get_chat_id(message)]
 
     async def pmlogaddcmd(self, message: Message):
         """
@@ -334,11 +366,11 @@ class LebedKAPMLogMod(loader.Module):
             or "Unknown"
         )
 
-    async def _topic_cacher(self, user: User):
-        if user.id not in self._topic_cache:
+    async def _topic_cacher(self, user: User, channel, cache: dict):
+        if user.id not in cache:
             forum = await self._client(
                 GetForumTopicsRequest(
-                    channel=self.c.id,
+                    channel=channel.id,
                     offset_date=datetime.now(),
                     offset_id=0,
                     offset_topic=0,
@@ -347,41 +379,41 @@ class LebedKAPMLogMod(loader.Module):
             )
             for topic in forum.topics:
                 if f"({user.id})" in topic.title:
-                    self._topic_cache[user.id] = topic
+                    cache[user.id] = topic
                     break
-        return user.id in self._topic_cache
+        return user.id in cache
 
-    async def _topic_creator(self, user: User):
+    async def _topic_creator(self, user: User, channel, cache: dict):
         await self._client(
             CreateForumTopicRequest(
-                channel=self.c.id,
+                channel=channel.id,
                 title=f"{self._entity_name(user)} ({user.id})",
                 icon_color=42,
             )
         )
-        return await self._topic_cacher(user)
+        return await self._topic_cacher(user, channel, cache)
 
-    async def _topic_handler(self, user: User, message: Message):
-        if not await self._topic_cacher(user):
-            await self._topic_creator(user)
+    async def _topic_handler(self, user: User, message: Message, channel, cache: dict):
+        if not await self._topic_cacher(user, channel, cache):
+            await self._topic_creator(user, channel, cache)
         new_title = f"{self._entity_name(user)} ({user.id})"
         if (
             self.config["realtime_names"]
-            and self._topic_cache[user.id].title != new_title
+            and cache[user.id].title != new_title
         ):
-            old_title = self._topic_cache[user.id].title
+            old_title = cache[user.id].title
             await self._client(
                 EditForumTopicRequest(
-                    channel=self.c.id,
-                    topic_id=self._topic_cache[user.id].id,
+                    channel=channel.id,
+                    topic_id=cache[user.id].id,
                     title=new_title,
                 )
             )
-            self._topic_cache[user.id].title = new_title
+            cache[user.id].title = new_title
             await message.client.send_message(
-                self.c.id,
+                channel.id,
                 f"New name:\n<code>{new_title}</code>\n\nOld name:\n<code>{old_title}</code>",
-                reply_to=self._topic_cache[user.id].id,
+                reply_to=cache[user.id].id,
             )
         return True
 
@@ -398,7 +430,7 @@ class LebedKAPMLogMod(loader.Module):
             return True
         return False
 
-    async def _mark_topic_read(self, msg: Message):
+    async def _mark_topic_read(self, msg: Message, channel):
         """Marks the forwarded message's topic as read in the log chat."""
         if not self.config["mark_read"]:
             return
@@ -416,21 +448,21 @@ class LebedKAPMLogMod(loader.Module):
             return
         await self._client(
             ReadDiscussionRequest(
-                self.c.id,
+                channel.id,
                 read_max_id,
                 2**31 - 1,
             )
         )
 
     async def _save_self_destructive(
-        self, user: User, message: Message, downloaded_media=None
+        self, user: User, message: Message, channel, cache: dict, downloaded_media=None
     ):
         """
         Downloads self-destructive media and sends it to the log chat as a
         regular document (without TTL), so it won't disappear from the log.
         Also handles self-destructive text-only messages.
         """
-        topic_id = self._topic_cache[user.id].id
+        topic_id = cache[user.id].id
         ttl = (
             getattr(getattr(message, "media", None), "ttl_seconds", None)
             or getattr(message, "ttl_seconds", None)
@@ -462,7 +494,7 @@ class LebedKAPMLogMod(loader.Module):
                 file.seek(0)
                 caption = header + utils.escape_html(message.text or "")
                 msg = await self._client.send_file(
-                    self.c.id,
+                    channel.id,
                     file,
                     force_document=True,
                     caption=caption,
@@ -472,28 +504,28 @@ class LebedKAPMLogMod(loader.Module):
                 logger.exception("Failed to download self-destructive media: %s", e)
                 text = utils.escape_html(message.text or message.raw_text or "")
                 msg = await self._client.send_message(
-                    self.c.id,
+                    channel.id,
                     header + text + "\n\n<i>⚠️ Failed to download media</i>",
                     reply_to=topic_id,
                 )
         else:
             text = utils.escape_html(message.text or message.raw_text or "")
             msg = await self._client.send_message(
-                self.c.id,
+                channel.id,
                 header + text,
                 reply_to=topic_id,
             )
 
-        await self._mark_topic_read(msg)
+        await self._mark_topic_read(msg, channel)
         return msg
 
-    async def _save_regular(self, user: User, message: Message):
+    async def _save_regular(self, user: User, message: Message, channel, cache: dict):
         """
         Fallback logger for messages that cannot be forwarded (e.g. content
         protected chats). Re-uploads media by downloading it, so nothing is
         lost from the log.
         """
-        topic_id = self._topic_cache[user.id].id
+        topic_id = cache[user.id].id
         media = getattr(message, "media", None)
         if media is not None:
             file = BytesIO()
@@ -509,7 +541,7 @@ class LebedKAPMLogMod(loader.Module):
             file.seek(0)
             caption = utils.escape_html(message.text or "")
             msg = await self._client.send_file(
-                self.c.id,
+                channel.id,
                 file,
                 caption=caption,
                 reply_to=topic_id,
@@ -517,11 +549,11 @@ class LebedKAPMLogMod(loader.Module):
         else:
             text = utils.escape_html(message.text or message.raw_text or "")
             msg = await self._client.send_message(
-                self.c.id,
+                channel.id,
                 text,
                 reply_to=topic_id,
             )
-        await self._mark_topic_read(msg)
+        await self._mark_topic_read(msg, channel)
         return msg
 
     async def _queue_handler(self, message: Message):
@@ -543,8 +575,12 @@ class LebedKAPMLogMod(loader.Module):
                 and not chatidindb
             ):
                 return
+            channel = self.c
+            cache = self._topic_cache
         elif self.config["log_groups"] and chatidindb:
             user = await message.get_chat()
+            channel = await self._ensure_group_channel()
+            cache = self._group_topic_cache
         else:
             return
         is_self_destr = self._is_self_destructive(message)
@@ -559,23 +595,23 @@ class LebedKAPMLogMod(loader.Module):
                 logger.exception("Failed to download self-destructive media: %s", e)
 
         try:
-            if await self._topic_handler(user, message):
+            if await self._topic_handler(user, message, channel, cache):
                 if is_self_destr:
                     if self.config["log_self_destr"]:
                         await self._save_self_destructive(
-                            user, message, downloaded_media
+                            user, message, channel, cache, downloaded_media
                         )
                     return
 
                 msg = await message.forward_to(
-                    self.c.id, top_msg_id=self._topic_cache[user.id].id
+                    channel.id, top_msg_id=cache[user.id].id
                 )
-                await self._mark_topic_read(msg)
+                await self._mark_topic_read(msg, channel)
         except Exception as e:
             if is_self_destr:
                 if self.config["log_self_destr"]:
                     await self._save_self_destructive(
-                        user, message, downloaded_media
+                        user, message, channel, cache, downloaded_media
                     )
                 else:
                     logger.debug(
@@ -585,7 +621,7 @@ class LebedKAPMLogMod(loader.Module):
                 return
 
             try:
-                await self._save_regular(user, message)
+                await self._save_regular(user, message, channel, cache)
             except Exception as e2:
                 logger.exception("Failed to log message: %s / %s", e, e2)
 
