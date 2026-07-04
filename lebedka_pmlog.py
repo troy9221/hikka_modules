@@ -4,10 +4,6 @@
 # 🌐 https://www.gnu.org/licenses/gpl-3.0.html
 
 # meta developer: @LebedKA_SYS
-# meta banner: https://t.me/LebedKA_SYS/11
-# meta pic: https://t.me/LebedKA_SYS/13
-# meta repo: https://github.com/troy9221/hikka_modules
-
 # scope: hikka_only
 # scope: hikka_min 1.3.3
 
@@ -41,17 +37,36 @@ class LebedKAPMLogMod(loader.Module):
     strings = {
         "name": "LebedKA-PMLog",
         "developer": "@LebedKA_SYS",
-        "_cfg_bots": "Whether to log bots or not.",
-        "_cfg_loglist": "Add telegram id's to log them.",
+        "_cfg_bots": "🤖 Log messages from bots too (default: off).",
+        "_cfg_loglist": (
+            "📋 List of chat/user ids for the filter below. Easier to manage"
+            " with .pmlogadd / .pmlogdel / .pmloglist."
+        ),
         "_cfg_selfdestructive": (
-            "Whether selfdestructive media should be logged or not. This"
-            " violates TG TOS!"
+            "🔥 Save self-destructive (TTL) photos/videos so they stay in the"
+            " log. ⚠️ Violates Telegram TOS — use at your own risk."
         ),
         "_cfg_whitelist": (
-            "Whether the list is a for excluded(True) or included(False) chats."
+            "🛡 List mode: ON = blacklist (log everyone EXCEPT the list), OFF ="
+            " whitelist (log ONLY the list)."
         ),
-        "_cfg_realtime_usernames": "Whether to update the topic names in realtime or not.",
-        "_cfg_mark_read": "Whether to mark the messages in the log as read or not.",
+        "_cfg_realtime_usernames": (
+            "🔄 Rename the topic when the user changes their name and post a"
+            " notice about it."
+        ),
+        "_cfg_mark_read": "👁 Mark logged messages as read in the log chat.",
+        "_cmd_doc_pmlogadd": "Add a chat/user id to the log list (reply, id or current chat).",
+        "_cmd_doc_pmlogdel": "Remove a chat/user id from the log list (reply, id or current chat).",
+        "_cmd_doc_pmloglist": "Show the current log list.",
+        "no_id": "🚫 <b>Could not determine the id. Reply to a message, pass an id or run in the target chat.</b>",
+        "added": "✅ <b>Id</b> <code>{}</code> <b>added to the log list.</b>",
+        "already_added": "ℹ️ <b>Id</b> <code>{}</code> <b>is already in the log list.</b>",
+        "removed": "✅ <b>Id</b> <code>{}</code> <b>removed from the log list.</b>",
+        "not_in_list": "ℹ️ <b>Id</b> <code>{}</code> <b>is not in the log list.</b>",
+        "list_empty": "📭 <b>The log list is empty.</b>",
+        "list_header": "📄 <b>Log list</b> ({} mode):\n{}",
+        "mode_white": "whitelist",
+        "mode_black": "blacklist",
     }
 
     strings_en = {}
@@ -71,14 +86,38 @@ class LebedKAPMLogMod(loader.Module):
     }
 
     strings_ru = {
-        "_cfg_bots": "Логировать ли ботов или нет",
-        "_cfg_loglist": "Добавьте айди Telegram, чтобы зарегистрировать их",
-        "_cfg_selfdestructive": (
-            "Должны ли самоуничтожающиеся медиафайлы регистрироваться или нет."
-            " Это нарушает «Условия использования Telegram» (ToS)"
+        "_cfg_bots": "🤖 Логировать ли сообщения ботов (по умолчанию выкл).",
+        "_cfg_loglist": (
+            "📋 Список id чатов/пользователей для фильтра ниже. Удобнее"
+            " управлять командами .pmlogadd / .pmlogdel / .pmloglist."
         ),
-        "_cfg_whitelist": "Использовать белый список (True) или черный (False).",
+        "_cfg_selfdestructive": (
+            "🔥 Сохранять самоуничтожающиеся (TTL) фото/видео, чтобы они"
+            " оставались в логе. ⚠️ Нарушает «Условия использования Telegram»"
+            " (ToS) — на свой страх и риск."
+        ),
+        "_cfg_whitelist": (
+            "🛡 Режим списка: ВКЛ = чёрный список (логировать всех, КРОМЕ"
+            " списка), ВЫКЛ = белый список (логировать ТОЛЬКО из списка)."
+        ),
+        "_cfg_realtime_usernames": (
+            "🔄 Переименовывать тему при смене имени пользователя и писать об"
+            " этом уведомление."
+        ),
+        "_cfg_mark_read": "👁 Отмечать залогированные сообщения прочитанными в чате лога.",
         "_cmd_doc_cpmlog": "Это откроет конфиг для модуля.",
+        "_cmd_doc_pmlogadd": "Добавить id чата/пользователя в список логирования (реплай, id или текущий чат).",
+        "_cmd_doc_pmlogdel": "Удалить id чата/пользователя из списка логирования (реплай, id или текущий чат).",
+        "_cmd_doc_pmloglist": "Показать текущий список логирования.",
+        "no_id": "🚫 <b>Не удалось определить id. Ответьте на сообщение, укажите id или запустите в нужном чате.</b>",
+        "added": "✅ <b>Id</b> <code>{}</code> <b>добавлен в список логирования.</b>",
+        "already_added": "ℹ️ <b>Id</b> <code>{}</code> <b>уже есть в списке логирования.</b>",
+        "removed": "✅ <b>Id</b> <code>{}</code> <b>удалён из списка логирования.</b>",
+        "not_in_list": "ℹ️ <b>Id</b> <code>{}</code> <b>отсутствует в списке логирования.</b>",
+        "list_empty": "📭 <b>Список логирования пуст.</b>",
+        "list_header": "📄 <b>Список логирования</b> (режим: {}):\n{}",
+        "mode_white": "белый список",
+        "mode_black": "чёрный список",
     }
 
     all_strings = {
@@ -110,7 +149,7 @@ class LebedKAPMLogMod(loader.Module):
             ),
             loader.ConfigValue(
                 "log_self_destr",
-                False,
+                True,
                 doc=lambda: self.strings("_cfg_selfdestructive"),
                 validator=loader.validators.Boolean(),
             ),
@@ -153,6 +192,74 @@ class LebedKAPMLogMod(loader.Module):
         name = self.strings("name")
         await self.allmodules.commands["config"](
             await utils.answer(message, f"{self.get_prefix()}config {name}")
+        )
+
+    async def _resolve_target_id(self, message: Message):
+        args = utils.get_args_raw(message)
+        if args:
+            try:
+                return int(args)
+            except ValueError:
+                try:
+                    entity = await self._client.get_entity(args)
+                    return entity.id
+                except Exception:
+                    return None
+        reply = await message.get_reply_message()
+        if reply:
+            return reply.sender_id
+        if message.is_private:
+            return utils.get_chat_id(message)
+        return None
+
+    async def pmlogaddcmd(self, message: Message):
+        """
+        Add a chat/user id to the log list (reply, id or current chat).
+        """
+        target = await self._resolve_target_id(message)
+        if target is None:
+            await utils.answer(message, self.strings("no_id"))
+            return
+        log_list = list(self.config["log_list"] or [])
+        if target in log_list:
+            await utils.answer(message, self.strings("already_added").format(target))
+            return
+        log_list.append(target)
+        self.config["log_list"] = log_list
+        await utils.answer(message, self.strings("added").format(target))
+
+    async def pmlogdelcmd(self, message: Message):
+        """
+        Remove a chat/user id from the log list (reply, id or current chat).
+        """
+        target = await self._resolve_target_id(message)
+        if target is None:
+            await utils.answer(message, self.strings("no_id"))
+            return
+        log_list = list(self.config["log_list"] or [])
+        if target not in log_list:
+            await utils.answer(message, self.strings("not_in_list").format(target))
+            return
+        log_list.remove(target)
+        self.config["log_list"] = log_list
+        await utils.answer(message, self.strings("removed").format(target))
+
+    async def pmloglistcmd(self, message: Message):
+        """
+        Show the current log list.
+        """
+        log_list = list(self.config["log_list"] or [])
+        if not log_list:
+            await utils.answer(message, self.strings("list_empty"))
+            return
+        mode = (
+            self.strings("mode_white")
+            if self.config["whitelist"]
+            else self.strings("mode_black")
+        )
+        items = "\n".join(f"• <code>{i}</code>" for i in log_list)
+        await utils.answer(
+            message, self.strings("list_header").format(mode, items)
         )
 
     async def _topic_cacher(self, user: User):
@@ -269,6 +376,10 @@ class LebedKAPMLogMod(loader.Module):
                 else:
                     file = BytesIO()
                     await self._client.download_media(message, file=file)
+
+                if file.getbuffer().nbytes == 0:
+                    raise ValueError("Downloaded media buffer is empty")
+
                 ext = ""
                 if message.file and message.file.ext:
                     ext = message.file.ext
@@ -301,6 +412,43 @@ class LebedKAPMLogMod(loader.Module):
                 reply_to=topic_id,
             )
 
+        await self._mark_topic_read(msg)
+        return msg
+
+    async def _save_regular(self, user: User, message: Message):
+        """
+        Fallback logger for messages that cannot be forwarded (e.g. content
+        protected chats). Re-uploads media by downloading it, so nothing is
+        lost from the log.
+        """
+        topic_id = self._topic_cache[user.id].id
+        media = getattr(message, "media", None)
+        if media is not None:
+            file = BytesIO()
+            await self._client.download_media(message, file=file)
+            if file.getbuffer().nbytes == 0:
+                raise ValueError("Downloaded media buffer is empty")
+            ext = ""
+            if message.file and message.file.ext:
+                ext = message.file.ext
+            file.name = (
+                (message.file.name if message.file else None) or f"media{ext}"
+            )
+            file.seek(0)
+            caption = utils.escape_html(message.text or "")
+            msg = await self._client.send_file(
+                self.c.id,
+                file,
+                caption=caption,
+                reply_to=topic_id,
+            )
+        else:
+            text = utils.escape_html(message.text or message.raw_text or "")
+            msg = await self._client.send_message(
+                self.c.id,
+                text,
+                reply_to=topic_id,
+            )
         await self._mark_topic_read(msg)
         return msg
 
@@ -345,13 +493,22 @@ class LebedKAPMLogMod(loader.Module):
                 )
                 await self._mark_topic_read(msg)
         except Exception as e:
-            if not self.config["log_self_destr"]:
-                logger.debug("Skipping self-destructive message (logging disabled): %s", e)
-                return
             if is_self_destr:
-                await self._save_self_destructive(user, message, downloaded_media)
-            else:
-                logger.exception("Failed to forward message: %s", e)
+                if self.config["log_self_destr"]:
+                    await self._save_self_destructive(
+                        user, message, downloaded_media
+                    )
+                else:
+                    logger.debug(
+                        "Skipping self-destructive message (logging disabled): %s",
+                        e,
+                    )
+                return
+
+            try:
+                await self._save_regular(user, message)
+            except Exception as e2:
+                logger.exception("Failed to log message: %s / %s", e, e2)
 
     @loader.watcher(only_messages=True)
     async def watcher(self, message: Message):
