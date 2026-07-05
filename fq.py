@@ -171,14 +171,14 @@ class Quotes(loader.Module):
     """Модуль для создания цитат из сообщений"""
 
     strings = {"name": "yg_quotes",
-               "no_reply": "<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Нет реплая на сообщение",
-               "processing": "<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Обработка…",
-               "api_processing": "<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Ожидание ответа API…",
-               "api_error": "<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Ошибка API: {}",
-               "loading_media": "<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Отправка…",
-               "no_args_or_reply": "<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Нет аргументов или реплая",
-               "args_error": "<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Ошибка разбора аргументов. Запрос: <code>{}</code>",
-               "too_many_messages": "<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Слишком много сообщений. Максимум: <code>{}</code>"}
+               "no_reply": "💬 Нет реплая на сообщение",
+               "processing": "💬 Обработка…",
+               "api_processing": "💬 Ожидание ответа API…",
+               "api_error": "💬 Ошибка API: {}",
+               "loading_media": "💬 Отправка…",
+               "no_args_or_reply": "💬 Нет аргументов или реплая",
+               "args_error": "💬 Ошибка разбора аргументов. Запрос: <code>{}</code>",
+               "too_many_messages": "💬 Слишком много сообщений. Максимум: <code>{}</code>"}
 
     def __init__(self):
         self.config=loader.ModuleConfig(
@@ -245,7 +245,7 @@ class Quotes(loader.Module):
             buf=io.BytesIO(r.content); buf.name="YgQuote.webp"
             await utils.answer(st,buf)
         except Exception as e:
-            return await utils.answer(m,f"<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Ошибка: {e}")
+            return await utils.answer(m,f"💬 Ошибка: {e}")
 
     async def fqcmd(self, m: Message):
         """
@@ -279,7 +279,7 @@ class Quotes(loader.Module):
             buf=io.BytesIO(r.content); buf.name="YgQuote.webp"
             await utils.answer(st,buf)
         except Exception as e:
-            return await utils.answer(m,f"<emoji document_id=6321272741005624970>🏳️‍🌈</emoji> Ошибка: {e}")
+            return await utils.answer(m,f"💬 Ошибка: {e}")
 
     async def parse(self, trg: Message, n: int) -> Optional[List[dict]]:
         try:

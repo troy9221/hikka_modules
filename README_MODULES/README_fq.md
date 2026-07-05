@@ -59,7 +59,7 @@ Hikka-модуль для создания красивых цитат из со
 
 ## Лицензия
 
-🔒 Licensed under the [GNU GPLv3](LICENSE)
+🔒 Licensed under the [GNU GPLv3](../LICENSE)
 
 ## Автор
 

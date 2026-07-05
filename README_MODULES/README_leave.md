@@ -26,7 +26,7 @@ Hikka-модуль для быстрого выхода из группы или
 
 ## Лицензия
 
-🔒 Licensed under the [GNU GPLv3](LICENSE)
+🔒 Licensed under the [GNU GPLv3](../LICENSE)
 
 ## Автор
 
