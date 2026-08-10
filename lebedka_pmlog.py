@@ -226,10 +226,19 @@ class LebedKAPMLogMod(loader.Module):
         """
         This will open the config for the module.
         """
+        # Prefer invoke(): utils.answer() may return True/False, and passing
+        # that into .config makes Hikka call .edit() on a bool.
         name = self.strings("name")
-        await self.allmodules.commands["config"](
-            await utils.answer(message, f"{self.get_prefix()}config {name}")
+        if hasattr(self, "invoke"):
+            await self.invoke("config", args=name, message=message)
+            return
+
+        answered = await utils.answer(
+            message, f"{self.get_prefix()}config {name}"
         )
+        if not isinstance(answered, Message):
+            answered = message
+        await self.allmodules.commands["config"](answered)
 
     @staticmethod
     def _normalize_id(chat_id: int) -> int:
@@ -341,10 +350,12 @@ class LebedKAPMLogMod(loader.Module):
         if not log_list:
             await utils.answer(message, self.strings("list_empty"))
             return
+        # config key "whitelist"=True means blacklist (skip listed ids),
+        # False means whitelist (log only listed ids). Labels must match that.
         mode = (
-            self.strings("mode_white")
+            self.strings("mode_black")
             if self.config["whitelist"]
-            else self.strings("mode_black")
+            else self.strings("mode_white")
         )
         lines = []
         for i in log_list:
