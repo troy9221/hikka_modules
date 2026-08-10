@@ -379,41 +379,144 @@ class LebedKAPMLogMod(loader.Module):
         return lock
 
     async def _topic_cacher(self, user: User, channel, cache: dict):
-        if user.id not in cache:
+        """
+        Finds the forum topic for a user/chat id and stores it in cache.
+        Paginates through all topics — a single page of 100 is not enough
+        for large log channels, and offset_date=now() skips existing topics.
+        """
+        if user.id in cache:
+            return True
+
+        needle = f"({user.id})"
+        offset_date = datetime(1970, 1, 1)
+        offset_id = 0
+        offset_topic = 0
+        seen = set()
+
+        while True:
             forum = await self._client(
                 GetForumTopicsRequest(
                     channel=channel.id,
-                    offset_date=datetime.now(),
-                    offset_id=0,
-                    offset_topic=0,
+                    offset_date=offset_date,
+                    offset_id=offset_id,
+                    offset_topic=offset_topic,
                     limit=100,
                 )
             )
-            for topic in forum.topics:
-                if f"({user.id})" in topic.title:
+            topics = getattr(forum, "topics", None) or []
+            if not topics:
+                break
+
+            page_ids = set()
+            for topic in topics:
+                page_ids.add(topic.id)
+                if needle in (topic.title or ""):
                     cache[user.id] = topic
-                    break
-        return user.id in cache
+                    return True
+
+            # Stop if the API keeps returning the same page.
+            if page_ids <= seen or len(topics) < 100:
+                break
+            seen |= page_ids
+
+            last = topics[-1]
+            # Continue pagination from the last returned topic.
+            offset_topic = last.id
+            offset_id = getattr(last, "top_message", 0) or 0
+            # date may be absent on ForumTopic; fall back to previous offset.
+            offset_date = getattr(last, "date", None) or offset_date
+
+        return False
 
     async def _topic_creator(self, user: User, channel, cache: dict):
         # Re-check the cache in case another coroutine created the topic
         # while we were waiting for the lock, to avoid duplicate topics.
         if await self._topic_cacher(user, channel, cache):
             return True
-        await self._client(
+
+        result = await self._client(
             CreateForumTopicRequest(
                 channel=channel.id,
                 title=f"{self._entity_name(user)} ({user.id})",
                 icon_color=42,
             )
         )
+
+        # Prefer the created topic from the API response — re-fetching via
+        # GetForumTopics can miss a brand-new topic (eventual consistency /
+        # pagination), which used to drop already-downloaded TTL media.
+        topic = self._topic_from_updates(result, user.id)
+        if topic is not None:
+            cache[user.id] = topic
+            return True
+
         cache.pop(user.id, None)
+        # Short delay then re-scan; topic list can lag right after create.
+        await asyncio.sleep(0.5)
         return await self._topic_cacher(user, channel, cache)
+
+    @staticmethod
+    def _topic_from_updates(updates, user_id: int):
+        """Extracts a newly created ForumTopic from CreateForumTopic updates."""
+        needle = f"({user_id})"
+        candidates = []
+
+        for attr in ("updates", "chats", "users"):
+            part = getattr(updates, attr, None)
+            if part:
+                candidates.extend(part)
+        candidates.append(updates)
+
+        for obj in candidates:
+            # messages.ForumTopics-like / direct ForumTopic
+            topics = getattr(obj, "topics", None)
+            if topics:
+                for topic in topics:
+                    if needle in (getattr(topic, "title", None) or ""):
+                        return topic
+                    # Single newly created topic — accept even without id match
+                    if len(topics) == 1 and getattr(topic, "id", None):
+                        return topic
+
+            title = getattr(obj, "title", None)
+            topic_id = getattr(obj, "id", None)
+            if title and needle in title and topic_id is not None:
+                # Duck-typed ForumTopic
+                if hasattr(obj, "top_message") or obj.__class__.__name__ == "ForumTopic":
+                    return obj
+
+            # UpdateNewChannelMessage with a service message that opens a topic
+            message = getattr(obj, "message", None)
+            action = getattr(message, "action", None) if message else None
+            if action is not None and getattr(action, "title", None):
+                if needle in action.title:
+                    # reply_to_msg_id / id of the topic root message is the topic id
+                    topic_id = getattr(
+                        getattr(message, "reply_to", None),
+                        "reply_to_msg_id",
+                        None,
+                    ) or getattr(message, "id", None)
+                    if topic_id is not None:
+                        class _Topic:
+                            pass
+
+                        t = _Topic()
+                        t.id = topic_id
+                        t.title = action.title
+                        t.top_message = getattr(message, "id", topic_id)
+                        return t
+
+        return None
 
     async def _topic_handler(self, user: User, message: Message, channel, cache: dict):
         async with self._get_topic_lock(channel, user.id):
             if not await self._topic_cacher(user, channel, cache):
-                await self._topic_creator(user, channel, cache)
+                if not await self._topic_creator(user, channel, cache):
+                    return False
+
+        if user.id not in cache:
+            return False
+
         new_title = f"{self._entity_name(user)} ({user.id})"
         if (
             self.config["realtime_names"]
@@ -442,11 +545,27 @@ class LebedKAPMLogMod(loader.Module):
         or is itself a self-destructive message (e.g. secret chat ttl_seconds).
         """
         media = getattr(message, "media", None)
-        if media is not None and getattr(media, "ttl_seconds", None):
+        # ttl_seconds can be on photo/document media; treat any non-None
+        # value (including 0) as self-destructive.
+        if media is not None and getattr(media, "ttl_seconds", None) is not None:
             return True
-        if getattr(message, "ttl_seconds", None):
+        if getattr(message, "ttl_seconds", None) is not None:
             return True
         return False
+
+    async def _download_ttl_media(self, message: Message):
+        """
+        Downloads TTL media ASAP into BytesIO. Must run before any slow
+        work (topic create/search), otherwise the file may already be gone.
+        """
+        buf = BytesIO()
+        result = await self._client.download_media(message, file=buf)
+        if result is None and buf.getbuffer().nbytes == 0:
+            raise ValueError("download_media returned no data")
+        if buf.getbuffer().nbytes == 0:
+            raise ValueError("Downloaded media buffer is empty")
+        buf.seek(0)
+        return buf
 
     async def _mark_topic_read(self, msg: Message, channel):
         """Marks the forwarded message's topic as read in the log chat."""
@@ -480,6 +599,9 @@ class LebedKAPMLogMod(loader.Module):
         regular document (without TTL), so it won't disappear from the log.
         Also handles self-destructive text-only messages.
         """
+        if user.id not in cache:
+            raise KeyError(f"No forum topic cached for {user.id}")
+
         topic_id = cache[user.id].id
         ttl = (
             getattr(getattr(message, "media", None), "ttl_seconds", None)
@@ -496,10 +618,9 @@ class LebedKAPMLogMod(loader.Module):
                 if downloaded_media is not None:
                     file = downloaded_media
                 else:
-                    file = BytesIO()
-                    await self._client.download_media(message, file=file)
+                    file = await self._download_ttl_media(message)
 
-                if file.getbuffer().nbytes == 0:
+                if not getattr(file, "getbuffer", None) or file.getbuffer().nbytes == 0:
                     raise ValueError("Downloaded media buffer is empty")
 
                 ext = ""
@@ -603,43 +724,78 @@ class LebedKAPMLogMod(loader.Module):
             return
         is_self_destr = self._is_self_destructive(message)
         downloaded_media = None
-        if is_self_destr and self.config["log_self_destr"]:
+
+        # Download TTL media immediately — before topic lookup/create.
+        # Opening the photo on another device (or a slow topic create) used
+        # to leave an empty/missing file by the time we tried to save it.
+        if is_self_destr and self.config["log_self_destr"] and message.media:
             try:
-                buf = BytesIO()
-                await self._client.download_media(message, file=buf)
-                buf.seek(0)
-                downloaded_media = buf
+                downloaded_media = await self._download_ttl_media(message)
             except Exception as e:
-                logger.exception("Failed to download self-destructive media: %s", e)
+                logger.exception(
+                    "Failed to pre-download self-destructive media: %s", e
+                )
 
         try:
-            if await self._topic_handler(user, message, channel, cache):
-                if is_self_destr:
-                    if self.config["log_self_destr"]:
-                        await self._save_self_destructive(
-                            user, message, channel, cache, downloaded_media
-                        )
+            topic_ok = await self._topic_handler(user, message, channel, cache)
+            if not topic_ok:
+                # Last chance: ensure topic exists before we drop bytes.
+                async with self._get_topic_lock(channel, user.id):
+                    topic_ok = await self._topic_creator(user, channel, cache)
+                if not topic_ok:
+                    logger.error(
+                        "PMLog: no forum topic for %s — cannot save message",
+                        user.id,
+                    )
                     return
 
-                msg = await message.forward_to(
-                    channel.id, top_msg_id=cache[user.id].id
-                )
-                await self._mark_topic_read(msg, channel)
-        except Exception as e:
             if is_self_destr:
                 if self.config["log_self_destr"]:
                     await self._save_self_destructive(
                         user, message, channel, cache, downloaded_media
                     )
-                else:
+                return
+
+            msg = await message.forward_to(
+                channel.id, top_msg_id=cache[user.id].id
+            )
+            await self._mark_topic_read(msg, channel)
+        except Exception as e:
+            if is_self_destr:
+                if not self.config["log_self_destr"]:
                     logger.debug(
                         "Skipping self-destructive message (logging disabled): %s",
                         e,
                     )
+                    return
+                try:
+                    if user.id not in cache:
+                        async with self._get_topic_lock(channel, user.id):
+                            await self._topic_creator(user, channel, cache)
+                    if user.id in cache:
+                        await self._save_self_destructive(
+                            user, message, channel, cache, downloaded_media
+                        )
+                    else:
+                        logger.exception(
+                            "PMLog: TTL media downloaded but topic missing for %s: %s",
+                            user.id,
+                            e,
+                        )
+                except Exception as e2:
+                    logger.exception(
+                        "Failed to save self-destructive message: %s / %s", e, e2
+                    )
                 return
 
             try:
-                await self._save_regular(user, message, channel, cache)
+                if user.id not in cache:
+                    async with self._get_topic_lock(channel, user.id):
+                        await self._topic_creator(user, channel, cache)
+                if user.id in cache:
+                    await self._save_regular(user, message, channel, cache)
+                else:
+                    logger.exception("Failed to log message (no topic): %s", e)
             except Exception as e2:
                 logger.exception("Failed to log message: %s / %s", e, e2)
 
