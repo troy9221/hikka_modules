@@ -60,6 +60,10 @@ class LebedKAPMLogMod(loader.Module):
             "👥 Also log group/supergroup chats that are added to the list"
             " above (by default only private chats are logged)."
         ),
+        "_cmd_doc_cpmlog": (
+            "Show/edit module config as text (no inline). "
+            "Usage: .cpmlog | .cpmlog <key> | .cpmlog <key> <value>"
+        ),
         "_cmd_doc_pmlogadd": "Add chat/user id(s) to the log list (reply, id(s) or current chat).",
         "_cmd_doc_pmlogdel": "Remove chat/user id(s) from the log list (reply, id(s) or current chat).",
         "_cmd_doc_pmloglist": "Show the current log list.",
@@ -72,6 +76,18 @@ class LebedKAPMLogMod(loader.Module):
         "list_header": "📄 <b>Log list</b> ({} mode):\n{}",
         "mode_white": "whitelist",
         "mode_black": "blacklist",
+        "cfg_header": "⚙️ <b>{}</b> config",
+        "cfg_usage": (
+            "\n\n<code>{p}cpmlog &lt;key&gt;</code> — show option\n"
+            "<code>{p}cpmlog &lt;key&gt; &lt;value&gt;</code> — set option\n"
+            "bool: <code>true/false</code> / <code>1/0</code> / <code>on/off</code>\n"
+            "list: manage via <code>{p}pmlogadd</code> / <code>{p}pmlogdel</code>"
+        ),
+        "cfg_unknown": "🚫 <b>Unknown option</b> <code>{}</code>.\nAvailable: {}",
+        "cfg_set": "✅ <b>{}</b> = <code>{}</code>",
+        "cfg_get": "⚙️ <b>{}</b> = <code>{}</code>\n{}",
+        "cfg_list_hint": "📋 Use <code>{}pmloglist</code> / <code>{}pmlogadd</code> / <code>{}pmlogdel</code> for this list.",
+        "cfg_bad_value": "🚫 <b>Invalid value for</b> <code>{}</code>: <code>{}</code>",
     }
 
     strings_en = {}
@@ -114,7 +130,10 @@ class LebedKAPMLogMod(loader.Module):
             "👥 Логировать также группы/супергруппы, добавленные в список выше"
             " (по умолчанию логируются только личные чаты)."
         ),
-        "_cmd_doc_cpmlog": "Это откроет конфиг для модуля.",
+        "_cmd_doc_cpmlog": (
+            "Показать/изменить конфиг модуля текстом (без inline). "
+            "Использование: .cpmlog | .cpmlog <ключ> | .cpmlog <ключ> <значение>"
+        ),
         "_cmd_doc_pmlogadd": "Добавить id чатов/пользователей в список логирования (реплай, id через пробел/запятую или текущий чат).",
         "_cmd_doc_pmlogdel": "Удалить id чатов/пользователей из списка логирования (реплай, id через пробел/запятую или текущий чат).",
         "_cmd_doc_pmloglist": "Показать текущий список логирования.",
@@ -127,6 +146,18 @@ class LebedKAPMLogMod(loader.Module):
         "list_header": "📄 <b>Список логирования</b> (режим: {}):\n{}",
         "mode_white": "белый список",
         "mode_black": "чёрный список",
+        "cfg_header": "⚙️ Конфиг <b>{}</b>",
+        "cfg_usage": (
+            "\n\n<code>{p}cpmlog &lt;ключ&gt;</code> — показать опцию\n"
+            "<code>{p}cpmlog &lt;ключ&gt; &lt;значение&gt;</code> — задать опцию\n"
+            "bool: <code>true/false</code> / <code>1/0</code> / <code>on/off</code>\n"
+            "список: через <code>{p}pmlogadd</code> / <code>{p}pmlogdel</code>"
+        ),
+        "cfg_unknown": "🚫 <b>Неизвестная опция</b> <code>{}</code>.\nДоступно: {}",
+        "cfg_set": "✅ <b>{}</b> = <code>{}</code>",
+        "cfg_get": "⚙️ <b>{}</b> = <code>{}</code>\n{}",
+        "cfg_list_hint": "📋 Список меняй через <code>{}pmloglist</code> / <code>{}pmlogadd</code> / <code>{}pmlogdel</code>.",
+        "cfg_bad_value": "🚫 <b>Некорректное значение для</b> <code>{}</code>: <code>{}</code>",
     }
 
     all_strings = {
@@ -222,23 +253,123 @@ class LebedKAPMLogMod(loader.Module):
             await self._client(ToggleForumRequest(self.gc.id, True))
         return self.gc
 
+    def _config_keys(self):
+        if hasattr(self.config, "config") and isinstance(self.config.config, dict):
+            return list(self.config.config.keys())
+        return list(self.config.keys())
+
+    def _config_doc(self, key: str) -> str:
+        try:
+            source = getattr(self.config, "config", None)
+            cfg = source[key] if isinstance(source, dict) and key in source else None
+            doc = getattr(cfg, "doc", None) if cfg is not None else None
+            if callable(doc):
+                doc = doc()
+            return utils.escape_html(str(doc or ""))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _format_cfg_value(value) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(i) for i in value) or "—"
+        return str(value)
+
+    @staticmethod
+    def _parse_bool(raw: str):
+        v = raw.strip().lower()
+        if v in {"1", "true", "yes", "on", "y", "вкл", "да"}:
+            return True
+        if v in {"0", "false", "no", "off", "n", "выкл", "нет"}:
+            return False
+        raise ValueError(raw)
+
     async def cpmlogcmd(self, message: Message):
         """
-        This will open the config for the module.
+        Show/edit module config as plain text.
+
+        Does not use Hikka .config / inline forms — those fail with
+        "No query results" when the inline bot is broken, ending in
+        AttributeError: 'bool' object has no attribute 'edit'.
         """
-        # Prefer invoke(): utils.answer() may return True/False, and passing
-        # that into .config makes Hikka call .edit() on a bool.
+        prefix = self.get_prefix()
         name = self.strings("name")
-        if hasattr(self, "invoke"):
-            await self.invoke("config", args=name, message=message)
+        keys = self._config_keys()
+        args = utils.get_args(message)
+
+        if not args:
+            lines = [self.strings("cfg_header").format(utils.escape_html(name))]
+            for key in keys:
+                val = self._format_cfg_value(self.config[key])
+                lines.append(f"• <code>{key}</code> = <code>{val}</code>")
+            lines.append(
+                self.strings("cfg_usage").format(p=utils.escape_html(prefix))
+            )
+            await utils.answer(message, "\n".join(lines))
             return
 
-        answered = await utils.answer(
-            message, f"{self.get_prefix()}config {name}"
+        key = args[0]
+        if key not in keys:
+            await utils.answer(
+                message,
+                self.strings("cfg_unknown").format(
+                    utils.escape_html(key),
+                    ", ".join(f"<code>{k}</code>" for k in keys),
+                ),
+            )
+            return
+
+        if len(args) == 1:
+            await utils.answer(
+                message,
+                self.strings("cfg_get").format(
+                    utils.escape_html(key),
+                    utils.escape_html(self._format_cfg_value(self.config[key])),
+                    self._config_doc(key),
+                ),
+            )
+            return
+
+        raw_value = " ".join(args[1:])
+        current = self.config[key]
+
+        if isinstance(current, list):
+            await utils.answer(
+                message,
+                self.strings("cfg_list_hint").format(prefix, prefix, prefix),
+            )
+            return
+
+        try:
+            if isinstance(current, bool):
+                new_value = self._parse_bool(raw_value)
+            elif isinstance(current, int) and not isinstance(current, bool):
+                new_value = int(raw_value)
+            else:
+                new_value = raw_value
+            self.config[key] = new_value
+        except Exception:
+            await utils.answer(
+                message,
+                self.strings("cfg_bad_value").format(
+                    utils.escape_html(key),
+                    utils.escape_html(raw_value),
+                ),
+            )
+            return
+
+        if key == "log_groups" and new_value:
+            await self._ensure_group_channel()
+
+        await utils.answer(
+            message,
+            self.strings("cfg_set").format(
+                utils.escape_html(key),
+                utils.escape_html(self._format_cfg_value(new_value)),
+            ),
         )
-        if not isinstance(answered, Message):
-            answered = message
-        await self.allmodules.commands["config"](answered)
 
     @staticmethod
     def _normalize_id(chat_id: int) -> int:
