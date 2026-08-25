@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import re
 from typing import List
 
 from telethon.errors import FloodWaitError
@@ -19,7 +20,7 @@ from .. import loader, utils
 
 logger = logging.getLogger(__name__)
 
-# Traditional / public-domain folk verses only (short couplets).
+# Starter public-domain verses only (short couplets).
 SONGS = [
     {
         "id": "kalinka",
@@ -173,31 +174,27 @@ SONGS = [
     },
 ]
 
+MAX_CUSTOM_LINES = 40
+MAX_CUSTOM_SONGS = 50
 
-def _find_song(query: str):
-    raw = (query or "").strip().lower()
-    if not raw:
-        return None
-    if raw in {"r", "rand", "random", "рандом", "случайная"}:
-        return random.choice(SONGS)
-    for song in SONGS:
-        if raw == song["id"] or raw in song["aliases"]:
-            return song
-        if raw in song["title"].lower():
-            return song
-    return None
+
+def _slug(title: str) -> str:
+    slug = re.sub(r"[^a-z0-9а-яё]+", "_", (title or "").lower()).strip("_")
+    return (slug or "song")[:32]
 
 
 @loader.tds
 class SingMod(loader.Module):
-    """Поёт народные песни текстом: правит одно сообщение строка за строкой."""
+    """Поёт текстом в одном сообщении: одна строка меняется. .sing — список, .sing 1 / название / random — спеть, .singadd — своя песня (реплай на текст), .singdel — удалить свою. Права в конфиге credits, во время песни не показываются."""
 
     strings = {
         "name": "Sing",
         "list": (
             "<b>🎤 Sing</b> — песни текстом\n"
             "<code>.sing</code> список · <code>.sing 1</code> спеть · "
-            "<code>.sing random</code> случайная · <code>.singstop</code> стоп\n\n"
+            "<code>.sing random</code> случайная · <code>.singstop</code> стоп\n"
+            "<code>.singadd название</code> реплай на текст · "
+            "<code>.singdel номер</code>\n\n"
             "{}"
         ),
         "item": "<code>{idx}</code> · <b>{title}</b>  <i>{aliases}</i>",
@@ -205,7 +202,18 @@ class SingMod(loader.Module):
         "busy": "<b>Уже пою.</b> Стоп: <code>.singstop</code>",
         "stopped": "<b>🎤 стоп</b>",
         "idle": "<b>Сейчас ничего не пою</b>",
-        "done": "★",
+        "add_usage": (
+            "Реплай на текст песни (каждая строка — куплет):\n"
+            "<code>.singadd Название</code>\n"
+            "Права на тексты — в конфиге модуля, поле <code>credits</code>."
+        ),
+        "added": "Добавлено: <b>{}</b> ({} строк). Спеть: <code>.sing {}</code>",
+        "no_lines": "<b>Нет текста.</b> Реплай на куплет или допиши строки после названия.",
+        "too_many_lines": "<b>Слишком длинно.</b> Максимум {} строк.",
+        "too_many_songs": "<b>Слишком много своих песен.</b> Максимум {}. Удали: <code>.singdel</code>",
+        "deleted": "Удалено: <b>{}</b>",
+        "not_custom": "Встроенные песни удалять нельзя. Только свои: <code>.singdel 11</code>",
+        "del_usage": "Удалить свою: <code>.singdel номер</code> или <code>.singdel название</code>",
     }
 
     def __init__(self):
@@ -218,15 +226,85 @@ class SingMod(loader.Module):
                 "Пауза между строками, секунды",
             ),
             loader.ConfigValue(
-                "history",
-                3,
-                "Сколько предыдущих строк оставлять на экране",
-                validator=loader.validators.Integer(minimum=1, maximum=8),
+                "credits",
+                (
+                    "Сектор Газа — © правообладатели наследия Ю. Клинских\n"
+                    "Король и Шут — © правообладатели\n"
+                    "Кино / В. Цой — © правообладатели наследия В. Цоя"
+                ),
+                "Права на пользовательские тексты. Во время песни не показывается.",
             ),
         )
 
     async def client_ready(self, client, db):
         self._client = client
+
+    def _custom(self) -> List[dict]:
+        raw = self.get("custom", []) or []
+        out: List[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            lines = [str(x).strip() for x in (item.get("lines") or []) if str(x).strip()]
+            if not title or not lines:
+                continue
+            aliases = item.get("aliases") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            out.append(
+                {
+                    "id": str(item.get("id") or _slug(title)),
+                    "title": title,
+                    "aliases": tuple(str(a) for a in aliases),
+                    "lines": lines,
+                    "custom": True,
+                }
+            )
+        return out
+
+    def _catalog(self) -> List[dict]:
+        return list(SONGS) + self._custom()
+
+    def _save_custom(self, songs: List[dict]) -> None:
+        payload = [
+            {
+                "id": s["id"],
+                "title": s["title"],
+                "aliases": list(s.get("aliases") or []),
+                "lines": list(s["lines"]),
+            }
+            for s in songs
+        ]
+        self.set("custom", payload)
+
+    def _find_song(self, query: str):
+        catalog = self._catalog()
+        raw = (query or "").strip().lower()
+        if not raw:
+            return None
+        if raw in {"r", "rand", "random", "рандом", "случайная"}:
+            return random.choice(catalog) if catalog else None
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(catalog):
+                return catalog[idx - 1]
+        for song in catalog:
+            aliases = song.get("aliases") or ()
+            if raw == str(song.get("id", "")).lower() or raw in {str(a).lower() for a in aliases}:
+                return song
+            if raw in song["title"].lower():
+                return song
+        return None
+
+    def _parse_lyrics(self, message: Message, raw: str):
+        title = (raw or "").strip()
+        lines: List[str] = []
+        if "\n" in title:
+            head, rest = title.split("\n", 1)
+            title = head.strip()
+            lines = [ln.strip() for ln in rest.splitlines() if ln.strip()]
+        return title, lines
 
     def _delay(self, line: str) -> float:
         try:
@@ -236,20 +314,8 @@ class SingMod(loader.Module):
         base = max(0.8, min(base, 8.0))
         return base + min(1.4, max(0.0, (len(line) - 18) * 0.035))
 
-    def _render(self, title: str, shown: List[str], *, finale: bool = False) -> str:
-        history = int(self.config["history"] or 3)
-        window = shown[-history:]
-        rows = [f"🎤 <b>{utils.escape_html(title)}</b>", ""]
-        for i, line in enumerate(window):
-            text = utils.escape_html(line)
-            if i == len(window) - 1 and not finale:
-                rows.append(f"<b>♪ {text}</b>")
-            else:
-                rows.append(f"<i>{text}</i>")
-        if finale:
-            rows.append("")
-            rows.append(f"<b>{self.strings['done']}</b>")
-        return "\n".join(rows)
+    def _render(self, line: str) -> str:
+        return f"<b>♪ {utils.escape_html(line)}</b>"
 
     async def _edit(self, message: Message, text: str) -> Message:
         try:
@@ -260,21 +326,14 @@ class SingMod(loader.Module):
 
     async def _sing(self, message: Message, song: dict):
         self._stop = False
-        shown: List[str] = []
-        msg = await self._edit(
-            message,
-            f"🎤 <b>{utils.escape_html(song['title'])}</b>\n\n♪ …",
-        )
+        msg = await self._edit(message, "♪ …")
         try:
             for line in song["lines"]:
                 if self._stop:
                     await self._edit(msg, self.strings["stopped"])
                     return
-                shown.append(line)
-                msg = await self._edit(msg, self._render(song["title"], shown))
+                msg = await self._edit(msg, self._render(line))
                 await asyncio.sleep(self._delay(line))
-            if not self._stop:
-                await self._edit(msg, self._render(song["title"], shown, finale=True))
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await self._edit(msg, self.strings["stopped"])
@@ -286,25 +345,28 @@ class SingMod(loader.Module):
 
     def _list_text(self) -> str:
         rows = []
-        for i, song in enumerate(SONGS, 1):
-            aliases = ", ".join(a for a in song["aliases"] if not a.isdigit())
+        for i, song in enumerate(self._catalog(), 1):
+            aliases = ", ".join(a for a in (song.get("aliases") or ()) if not str(a).isdigit())
+            mark = " · своя" if song.get("custom") else ""
             rows.append(
                 self.strings["item"].format(
                     idx=i,
-                    title=song["title"],
+                    title=utils.escape_html(song["title"]) + mark,
                     aliases=utils.escape_html(aliases),
                 )
             )
         return self.strings["list"].format("\n".join(rows))
 
-    @loader.command()
+    @loader.command(
+        ru_doc="без аргументов — список; номер, название или random — спеть (одна строка на экране)",
+    )
     async def sing(self, message: Message):
-        """[номер|название|random] — спеть песню текстом"""
+        """без аргументов — список; номер, название или random — спеть (одна строка на экране)"""
         args = utils.get_args_raw(message).strip()
         if not args:
             await utils.answer(message, self._list_text())
             return
-        song = _find_song(args)
+        song = self._find_song(args)
         if not song:
             await utils.answer(message, self.strings["unknown"])
             return
@@ -313,9 +375,78 @@ class SingMod(loader.Module):
             return
         self._task = asyncio.create_task(self._sing(message, song))
 
-    @loader.command()
+    @loader.command(
+        ru_doc="<название> — добавить свою песню: реплай на текст или строки ниже названия",
+    )
+    async def singadd(self, message: Message):
+        """<название> — добавить свою песню: реплай на текст или строки ниже названия"""
+        raw = utils.get_args_raw(message)
+        title, lines = self._parse_lyrics(message, raw)
+        reply = await message.get_reply_message()
+        if reply and getattr(reply, "raw_text", None) and not lines:
+            lines = [ln.strip() for ln in reply.raw_text.splitlines() if ln.strip()]
+        if not title:
+            await utils.answer(message, self.strings["add_usage"])
+            return
+        if not lines:
+            await utils.answer(message, self.strings["no_lines"])
+            return
+        if len(lines) > MAX_CUSTOM_LINES:
+            await utils.answer(message, self.strings["too_many_lines"].format(MAX_CUSTOM_LINES))
+            return
+        custom = self._custom()
+        if len(custom) >= MAX_CUSTOM_SONGS:
+            await utils.answer(message, self.strings["too_many_songs"].format(MAX_CUSTOM_SONGS))
+            return
+        song_id = _slug(title)
+        existing_ids = {s["id"] for s in custom}
+        if song_id in existing_ids or any(s["id"] == song_id for s in SONGS):
+            n = 2
+            while f"{song_id}_{n}" in existing_ids:
+                n += 1
+            song_id = f"{song_id}_{n}"
+        custom.append(
+            {
+                "id": song_id,
+                "title": title,
+                "aliases": (title.lower(), song_id),
+                "lines": lines,
+            }
+        )
+        self._save_custom(custom)
+        idx = len(SONGS) + len(custom)
+        await utils.answer(
+            message,
+            self.strings["added"].format(
+                utils.escape_html(title),
+                len(lines),
+                idx,
+            ),
+        )
+
+    @loader.command(
+        ru_doc="<номер или название> — удалить свою песню (встроенные нельзя)",
+    )
+    async def singdel(self, message: Message):
+        """<номер или название> — удалить свою песню (встроенные нельзя)"""
+        args = utils.get_args_raw(message).strip()
+        if not args:
+            await utils.answer(message, self.strings["del_usage"])
+            return
+        song = self._find_song(args)
+        if not song:
+            await utils.answer(message, self.strings["unknown"])
+            return
+        if not song.get("custom"):
+            await utils.answer(message, self.strings["not_custom"])
+            return
+        custom = [s for s in self._custom() if s["id"] != song["id"]]
+        self._save_custom(custom)
+        await utils.answer(message, self.strings["deleted"].format(utils.escape_html(song["title"])))
+
+    @loader.command(ru_doc="остановить текущую песню")
     async def singstop(self, message: Message):
-        """Остановить текущую песню"""
+        """остановить текущую песню"""
         if not self._task or self._task.done():
             await utils.answer(message, self.strings["idle"])
             return
