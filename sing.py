@@ -11,7 +11,7 @@ import contextlib
 import logging
 import random
 import re
-from typing import List
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from telethon.errors import FloodWaitError
 from telethon.tl.types import Message
@@ -20,12 +20,49 @@ from .. import loader, utils
 
 logger = logging.getLogger(__name__)
 
-# Starter public-domain verses only (short couplets).
+# Public-domain / traditional couplets only. Copyrighted rap, rock and pop stay out of the repo.
+GENRE_LABELS = {
+    "folk": "Народные",
+    "romance": "Романсы",
+    "shanty": "Шанти",
+    "blues": "Блюз",
+    "gospel": "Спиричуэлс",
+    "country": "Кантри",
+    "oldpop": "Старые хиты",
+    "ballad": "Баллады",
+    "custom": "Свои",
+}
+GENRE_ORDER = (
+    "folk",
+    "romance",
+    "shanty",
+    "blues",
+    "gospel",
+    "country",
+    "oldpop",
+    "ballad",
+    "custom",
+)
+GENRE_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "folk": ("народные", "народ", "folk", "фолк"),
+    "romance": ("романсы", "романс", "romance"),
+    "shanty": ("шанти", "shanty", "море"),
+    "blues": ("блюз", "blues"),
+    "gospel": ("спиричуэлс", "gospel", "госпел", "духовные"),
+    "country": ("кантри", "country", "ковбой"),
+    "oldpop": ("хиты", "oldies", "эстрада"),
+    "ballad": ("баллады", "баллада", "ballad"),
+}
+ROCK_GENRES = ("shanty", "blues", "ballad")
+ROCK_QUERIES = {"рок", "rock"}
+RAP_QUERIES = {"рэп", "rap", "хип-хоп", "хипхоп", "hiphop", "hip-hop", "hip hop"}
+
 SONGS = [
     {
         "id": "kalinka",
         "title": "Калинка",
-        "aliases": ("калинка", "kalinka", "1"),
+        "genre": "folk",
+        "aliases": ("калинка", "kalinka"),
         "lines": [
             "Калинка, калинка, калинка моя",
             "В саду ягода малинка, малинка моя",
@@ -40,7 +77,8 @@ SONGS = [
     {
         "id": "berioza",
         "title": "Во поле берёза стояла",
-        "aliases": ("берёза", "береза", "berioza", "2"),
+        "genre": "folk",
+        "aliases": ("берёза", "береза", "berioza"),
         "lines": [
             "Во поле берёза стояла",
             "Во поле кудрявая стояла",
@@ -55,7 +93,8 @@ SONGS = [
     {
         "id": "moroz",
         "title": "Ой, мороз, мороз",
-        "aliases": ("мороз", "moroz", "3"),
+        "genre": "folk",
+        "aliases": ("мороз", "moroz"),
         "lines": [
             "Ой, мороз, мороз",
             "Не морозь меня",
@@ -70,7 +109,8 @@ SONGS = [
     {
         "id": "mesyats",
         "title": "Светит месяц",
-        "aliases": ("месяц", "светит", "mesyats", "4"),
+        "genre": "folk",
+        "aliases": ("месяц", "светит", "mesyats"),
         "lines": [
             "Светит месяц, светит ясный",
             "Светит белая луна",
@@ -85,7 +125,8 @@ SONGS = [
     {
         "id": "korobeiniki",
         "title": "Коробейники",
-        "aliases": ("коробейники", "korobeiniki", "тетра", "5"),
+        "genre": "folk",
+        "aliases": ("коробейники", "korobeiniki", "тетра"),
         "lines": [
             "Ой, полна, полна коробушка",
             "Есть и ситцы, и парча",
@@ -100,7 +141,8 @@ SONGS = [
     {
         "id": "razin",
         "title": "Из-за острова на стрежень",
-        "aliases": ("разин", "стрежень", "razin", "6"),
+        "genre": "folk",
+        "aliases": ("разин", "стрежень", "razin"),
         "lines": [
             "Из-за острова на стрежень",
             "На простор речной волны",
@@ -115,7 +157,8 @@ SONGS = [
     {
         "id": "kuznitsa",
         "title": "Во кузнице",
-        "aliases": ("кузница", "kuznitsa", "7"),
+        "genre": "folk",
+        "aliases": ("кузница", "kuznitsa"),
         "lines": [
             "Во кузнице, во кузнице",
             "Кузнец куёт, кузнец куёт",
@@ -130,7 +173,8 @@ SONGS = [
     {
         "id": "yablochko",
         "title": "Яблочко",
-        "aliases": ("яблочко", "yablochko", "8"),
+        "genre": "folk",
+        "aliases": ("яблочко", "yablochko"),
         "lines": [
             "Эх, яблочко, да куда котишься",
             "Ко мне в рот попадёшь — не воротишься",
@@ -145,7 +189,8 @@ SONGS = [
     {
         "id": "voron",
         "title": "Чёрный ворон",
-        "aliases": ("ворон", "voron", "чёрный", "черный", "9"),
+        "genre": "folk",
+        "aliases": ("ворон", "voron", "чёрный", "черный"),
         "lines": [
             "Чёрный ворон, что ты вьёшься",
             "Над моею головой",
@@ -160,7 +205,8 @@ SONGS = [
     {
         "id": "seni",
         "title": "Ах вы, сени, мои сени",
-        "aliases": ("сени", "seni", "ах вы сени", "10"),
+        "genre": "folk",
+        "aliases": ("сени", "seni", "ах вы сени"),
         "lines": [
             "Ах вы, сени, мои сени",
             "Сени новые мои",
@@ -172,9 +218,451 @@ SONGS = [
             "Девица душа",
         ],
     },
+    {
+        "id": "sad",
+        "title": "Во саду ли в огороде",
+        "genre": "folk",
+        "aliases": ("сад", "огород", "вишенка"),
+        "lines": [
+            "Во саду ли в огороде",
+            "Вишенка росла",
+            "Во саду ли в огороде",
+            "Вишенка росла",
+            "Разрезвилася девица",
+            "Душа красная",
+            "Разрезвилася девица",
+            "Душа красная",
+        ],
+    },
+    {
+        "id": "valenki",
+        "title": "Валенки",
+        "genre": "folk",
+        "aliases": ("валенки", "valenki"),
+        "lines": [
+            "Валенки, валенки",
+            "Эх, неподшиты, стареньки",
+            "Нельзя валенки носить",
+            "Не в чем к милому ходить",
+            "Валенки, валенки",
+            "Эх, неподшиты, стареньки",
+            "Нельзя валенки носить",
+            "Не в чем к милому ходить",
+        ],
+    },
+    {
+        "id": "dubinushka",
+        "title": "Дубинушка",
+        "genre": "folk",
+        "aliases": ("дубинушка", "ухнем", "dubinushka"),
+        "lines": [
+            "Эх, дубинушка, ухнем",
+            "Эх, зелёная, сама пойдёт",
+            "Потянем мы дубину",
+            "Сам пойдёт, сам пойдёт",
+            "Ай-да ухнем",
+            "Ай-да ухнем",
+            "Ещё разик, ещё раз",
+            "Ещё разик, ещё раз",
+        ],
+    },
+    {
+        "id": "rechka",
+        "title": "Вдоль да по речке",
+        "genre": "folk",
+        "aliases": ("речке", "казанке", "селезень"),
+        "lines": [
+            "Вдоль да по речке",
+            "Вдоль да по Казанке",
+            "Сизый селезень плывёт",
+            "Сизый селезень плывёт",
+            "Вдоль да по бережку",
+            "Вдоль да по крутому",
+            "Добрый молодец идёт",
+            "Добрый молодец идёт",
+        ],
+    },
+    {
+        "id": "to_ne_vecher",
+        "title": "Ой, то не вечер",
+        "genre": "folk",
+        "aliases": ("то не вечер", "казачья", "вечер"),
+        "lines": [
+            "Ой, то не вечер, то не вечер",
+            "Мне малым-мало спалось",
+            "Мне малым-мало спалось",
+            "Мне много во сне виделось",
+            "Мне много во сне виделось",
+            "Ой, то не вечер, то не вечер",
+            "Мне малым-мало спалось",
+            "Мне много во сне виделось",
+        ],
+    },
+    {
+        "id": "step",
+        "title": "Степь да степь кругом",
+        "genre": "folk",
+        "aliases": ("степь", "ямщик", "step"),
+        "lines": [
+            "Степь да степь кругом",
+            "Путь далёк лежит",
+            "В той степи глухой",
+            "Ямщик замирает",
+            "Степь да степь кругом",
+            "Путь далёк лежит",
+            "Колокольчик однозвучный",
+            "Уныло гремит",
+        ],
+    },
+    {
+        "id": "zabaykalye",
+        "title": "По диким степям Забайкалья",
+        "genre": "folk",
+        "aliases": ("забайкалья", "бродяга", "zabaykalye"),
+        "lines": [
+            "По диким степям Забайкалья",
+            "Где золото роют в горах",
+            "Бродяга, судьба несчастная",
+            "Таскает кандалы в горах",
+            "По диким степям Забайкалья",
+            "Где золото роют в горах",
+            "Бродяга, судьба несчастная",
+            "Таскает кандалы в горах",
+        ],
+    },
+    {
+        "id": "ochi",
+        "title": "Очи чёрные",
+        "genre": "romance",
+        "aliases": ("очи", "чёрные", "черные", "ochi"),
+        "lines": [
+            "Очи чёрные, очи страстные",
+            "Очи жгучие и прекрасные",
+            "Как люблю я вас",
+            "Как боюсь я вас",
+            "Знать, увидел вас",
+            "В недобрый час",
+            "Очи чёрные, очи страстные",
+            "Очи жгучие и прекрасные",
+        ],
+    },
+    {
+        "id": "ryabina",
+        "title": "Тонкая рябина",
+        "genre": "romance",
+        "aliases": ("рябина", "рябина тонкая", "ryabina"),
+        "lines": [
+            "Что стоишь, качаясь",
+            "Тонкая рябина",
+            "Головой склоняясь",
+            "До самого тына",
+            "А через дорогу",
+            "За рекой широкой",
+            "Так же одиноко",
+            "Дуб стоит высокий",
+        ],
+    },
+    {
+        "id": "two_guitars",
+        "title": "Две гитары",
+        "genre": "romance",
+        "aliases": ("гитары", "две гитары"),
+        "lines": [
+            "Две гитары за стеною",
+            "Жалобно заныли",
+            "С детства памятный мотив",
+            "Мне вы навеяли",
+            "Две гитары, зазвенев",
+            "Жалобно заныли",
+            "С детства памятный мотив",
+            "Мне вы навеяли",
+        ],
+    },
+    {
+        "id": "drunken_sailor",
+        "title": "Drunken Sailor",
+        "genre": "shanty",
+        "aliases": ("drunken", "sailor", "пьяный матрос"),
+        "lines": [
+            "What shall we do with a drunken sailor",
+            "What shall we do with a drunken sailor",
+            "What shall we do with a drunken sailor",
+            "Early in the morning",
+            "Way hay and up she rises",
+            "Way hay and up she rises",
+            "Way hay and up she rises",
+            "Early in the morning",
+        ],
+    },
+    {
+        "id": "blow_the_man_down",
+        "title": "Blow the Man Down",
+        "genre": "shanty",
+        "aliases": ("blow", "man down"),
+        "lines": [
+            "I'll sing you a song, a good song of the sea",
+            "With a way, hey, blow the man down",
+            "And trust that you'll join in the chorus with me",
+            "Give me some time to blow the man down",
+            "Way, hey, blow the man down",
+            "Give me some time to blow the man down",
+        ],
+    },
+    {
+        "id": "spanish_ladies",
+        "title": "Spanish Ladies",
+        "genre": "shanty",
+        "aliases": ("spanish ladies", "ladies"),
+        "lines": [
+            "Farewell and adieu to you, Spanish ladies",
+            "Farewell and adieu to you, ladies of Spain",
+            "For we've received orders to sail for old England",
+            "And we hope in a short time to see you again",
+            "We'll rant and we'll roar like true British sailors",
+            "We'll rant and we'll roar all on the salt sea",
+        ],
+    },
+    {
+        "id": "rising_sun",
+        "title": "House of the Rising Sun",
+        "genre": "blues",
+        "aliases": ("rising sun", "new orleans", "house of the"),
+        "lines": [
+            "There is a house in New Orleans",
+            "They call the Rising Sun",
+            "And it's been the ruin of many a poor boy",
+            "And God, I know I'm one",
+            "My mother was a tailor",
+            "She sewed my new blue jeans",
+            "My father was a gamblin' man",
+            "Down in New Orleans",
+        ],
+    },
+    {
+        "id": "st_james",
+        "title": "St. James Infirmary",
+        "genre": "blues",
+        "aliases": ("st james", "infirmary", "saint james"),
+        "lines": [
+            "I went down to St. James Infirmary",
+            "I saw my baby there",
+            "Stretched out on a long white table",
+            "So sweet, so cold, so fair",
+            "Let her go, let her go, God bless her",
+            "Wherever she may be",
+            "She can search this whole wide world over",
+            "She'll never find another like me",
+        ],
+    },
+    {
+        "id": "careless_love",
+        "title": "Careless Love",
+        "genre": "blues",
+        "aliases": ("careless", "careless love"),
+        "lines": [
+            "Love, oh love, oh careless love",
+            "Love, oh love, oh careless love",
+            "Love, oh love, oh careless love",
+            "See what careless love has done",
+            "I love my mama and papa too",
+            "I love my mama and papa too",
+            "I love my mama and papa too",
+            "I'd leave them both to go with you",
+        ],
+    },
+    {
+        "id": "amazing_grace",
+        "title": "Amazing Grace",
+        "genre": "gospel",
+        "aliases": ("amazing", "grace", "амазинг"),
+        "lines": [
+            "Amazing grace, how sweet the sound",
+            "That saved a wretch like me",
+            "I once was lost, but now am found",
+            "Was blind, but now I see",
+            "'Twas grace that taught my heart to fear",
+            "And grace my fears relieved",
+            "How precious did that grace appear",
+            "The hour I first believed",
+        ],
+    },
+    {
+        "id": "saints",
+        "title": "When the Saints Go Marching In",
+        "genre": "gospel",
+        "aliases": ("saints", "marching", "святые"),
+        "lines": [
+            "Oh when the saints go marching in",
+            "Oh when the saints go marching in",
+            "Lord, I want to be in that number",
+            "When the saints go marching in",
+            "Oh when the sun refuse to shine",
+            "Oh when the sun refuse to shine",
+            "Lord, I want to be in that number",
+            "When the sun refuse to shine",
+        ],
+    },
+    {
+        "id": "swing_low",
+        "title": "Swing Low, Sweet Chariot",
+        "genre": "gospel",
+        "aliases": ("swing low", "chariot", "колесница"),
+        "lines": [
+            "Swing low, sweet chariot",
+            "Coming for to carry me home",
+            "Swing low, sweet chariot",
+            "Coming for to carry me home",
+            "I looked over Jordan, and what did I see",
+            "Coming for to carry me home",
+            "A band of angels coming after me",
+            "Coming for to carry me home",
+        ],
+    },
+    {
+        "id": "home_on_the_range",
+        "title": "Home on the Range",
+        "genre": "country",
+        "aliases": ("home on the range", "buffalo", "range"),
+        "lines": [
+            "Oh give me a home where the buffalo roam",
+            "Where the deer and the antelope play",
+            "Where seldom is heard a discouraging word",
+            "And the skies are not cloudy all day",
+            "Home, home on the range",
+            "Where the deer and the antelope play",
+            "Where seldom is heard a discouraging word",
+            "And the skies are not cloudy all day",
+        ],
+    },
+    {
+        "id": "clementine",
+        "title": "Oh My Darling Clementine",
+        "genre": "country",
+        "aliases": ("clementine", "клементин"),
+        "lines": [
+            "In a cavern, in a canyon",
+            "Excavating for a mine",
+            "Dwelt a miner forty-niner",
+            "And his daughter Clementine",
+            "Oh my darling, oh my darling",
+            "Oh my darling Clementine",
+            "You are lost and gone forever",
+            "Dreadful sorry, Clementine",
+        ],
+    },
+    {
+        "id": "red_river",
+        "title": "Red River Valley",
+        "genre": "country",
+        "aliases": ("red river", "valley"),
+        "lines": [
+            "From this valley they say you are going",
+            "We will miss your bright eyes and sweet smile",
+            "For they say you are taking the sunshine",
+            "That has brightened our pathway a while",
+            "Come and sit by my side if you love me",
+            "Do not hasten to bid me adieu",
+            "But remember the Red River Valley",
+            "And the one that has loved you so true",
+        ],
+    },
+    {
+        "id": "oh_susanna",
+        "title": "Oh! Susanna",
+        "genre": "oldpop",
+        "aliases": ("susanna", "сьюзанна", "alabama"),
+        "lines": [
+            "I come from Alabama with a banjo on my knee",
+            "I'm going to Louisiana, my true love for to see",
+            "It rained all night the day I left",
+            "The weather it was dry",
+            "Oh, Susanna, oh don't you cry for me",
+            "For I come from Alabama with a banjo on my knee",
+        ],
+    },
+    {
+        "id": "jingle_bells",
+        "title": "Jingle Bells",
+        "genre": "oldpop",
+        "aliases": ("jingle", "колокольчики", "sleigh"),
+        "lines": [
+            "Dashing through the snow",
+            "In a one-horse open sleigh",
+            "O'er the fields we go",
+            "Laughing all the way",
+            "Jingle bells, jingle bells",
+            "Jingle all the way",
+            "Oh what fun it is to ride",
+            "In a one-horse open sleigh",
+        ],
+    },
+    {
+        "id": "auld_lang_syne",
+        "title": "Auld Lang Syne",
+        "genre": "oldpop",
+        "aliases": ("auld lang syne", "олд ланг", "syne"),
+        "lines": [
+            "Should auld acquaintance be forgot",
+            "And never brought to mind",
+            "Should auld acquaintance be forgot",
+            "And auld lang syne",
+            "For auld lang syne, my dear",
+            "For auld lang syne",
+            "We'll take a cup of kindness yet",
+            "For auld lang syne",
+        ],
+    },
+    {
+        "id": "scarborough",
+        "title": "Scarborough Fair",
+        "genre": "oldpop",
+        "aliases": ("scarborough", "parsley", "скарборо"),
+        "lines": [
+            "Are you going to Scarborough Fair",
+            "Parsley, sage, rosemary and thyme",
+            "Remember me to one who lives there",
+            "She once was a true love of mine",
+            "Tell her to make me a cambric shirt",
+            "Parsley, sage, rosemary and thyme",
+            "Without no seams nor needle work",
+            "Then she'll be a true love of mine",
+        ],
+    },
+    {
+        "id": "cucaracha",
+        "title": "La Cucaracha",
+        "genre": "oldpop",
+        "aliases": ("cucaracha", "таракан"),
+        "lines": [
+            "La cucaracha, la cucaracha",
+            "Ya no puede caminar",
+            "Porque no tiene, porque le falta",
+            "Las patitas de atrás",
+            "La cucaracha, la cucaracha",
+            "Ya no puede caminar",
+            "Porque no tiene, porque le falta",
+            "Las patitas de atrás",
+        ],
+    },
+    {
+        "id": "john_henry",
+        "title": "John Henry",
+        "genre": "ballad",
+        "aliases": ("john henry", "steel", "джон генри"),
+        "lines": [
+            "John Henry was a steel-driving man",
+            "Lord, Lord",
+            "John Henry was a steel-driving man",
+            "He hammered on the mountain",
+            "Till his hammer caught on fire",
+            "John Henry was a steel-driving man",
+            "Lord, Lord",
+            "John Henry was a steel-driving man",
+        ],
+    },
 ]
 
-MAX_CUSTOM_LINES = 40
+MAX_CUSTOM_LINES = 80
 MAX_CUSTOM_SONGS = 50
 
 
@@ -183,36 +671,61 @@ def _slug(title: str) -> str:
     return (slug or "song")[:32]
 
 
+def _genre_of(song: dict) -> str:
+    if song.get("custom"):
+        return "custom"
+    genre = str(song.get("genre") or "folk")
+    return genre if genre in GENRE_LABELS else "folk"
+
+
+def _match_genre(query: str) -> Optional[str]:
+    raw = (query or "").strip().lower()
+    if not raw:
+        return None
+    for genre, aliases in GENRE_ALIASES.items():
+        if raw == genre or raw in aliases:
+            return genre
+    return None
+
+
 @loader.tds
 class SingMod(loader.Module):
-    """Поёт текстом в одном сообщении: одна строка меняется. .sing — список, .sing 1 / название / random — спеть, .singadd — своя песня (реплай на текст), .singdel — удалить свою. Права в конфиге credits, во время песни не показываются."""
+    """Поёт текстом в одном сообщении: одна строка меняется. .sing — список, .sing 1 / название / жанр / random — спеть, .singadd — своя песня, .singdel — удалить свою. Рэп, рок, поп — только .singadd."""
 
     strings = {
         "name": "Sing",
         "list": (
             "<b>🎤 Sing</b> — песни текстом\n"
-            "<code>.sing</code> список · <code>.sing 1</code> спеть · "
-            "<code>.sing random</code> случайная · <code>.singstop</code> стоп\n"
-            "<code>.singadd название</code> реплай на текст · "
-            "<code>.singdel номер</code>\n\n"
+            "В комплекте народные, романсы, шанти, блюз, спиричуэлс, кантри, старые хиты.\n"
+            "Рэп, рок, поп — <code>.singadd</code>\n"
+            "<code>.sing 1</code> · <code>.sing блюз</code> · <code>.sing random</code> · "
+            "<code>.singstop</code>\n\n"
             "{}"
         ),
-        "item": "<code>{idx}</code> · <b>{title}</b>  <i>{aliases}</i>",
+        "group": "\n<b>{label}</b>",
+        "item": "<code>{idx}</code> · {title}",
         "unknown": "<b>Нет такой песни.</b> Список: <code>.sing</code>",
         "busy": "<b>Уже пою.</b> Стоп: <code>.singstop</code>",
         "stopped": "<b>🎤 стоп</b>",
         "idle": "<b>Сейчас ничего не пою</b>",
+        "no_rap": (
+            "<b>Популярный рэп в комплект нельзя</b> (копирайт).\n"
+            "Добавь свой текст: реплай на куплет и <code>.singadd Название</code>"
+        ),
+        "no_genre": "<b>В этом жанре пока пусто.</b> Список: <code>.sing</code>",
         "add_usage": (
-            "Реплай на текст песни (каждая строка — куплет):\n"
-            "<code>.singadd Название</code>\n"
-            "Права на тексты — в конфиге модуля, поле <code>credits</code>."
+            "Как добавить свою песню (текст остаётся только у тебя):\n"
+            "1) Отправь куплет сообщением или .txt-файлом — каждая строка отдельный такт\n"
+            "2) Реплай: <code>.singadd Название</code>\n\n"
+            "Рэп, рок, поп, Кино, КиШ, Сектор Газа — только так.\n"
+            "Права — поле <code>credits</code> в конфиге, во время песни не показываются."
         ),
         "added": "Добавлено: <b>{}</b> ({} строк). Спеть: <code>.sing {}</code>",
         "no_lines": "<b>Нет текста.</b> Реплай на куплет или допиши строки после названия.",
         "too_many_lines": "<b>Слишком длинно.</b> Максимум {} строк.",
         "too_many_songs": "<b>Слишком много своих песен.</b> Максимум {}. Удали: <code>.singdel</code>",
         "deleted": "Удалено: <b>{}</b>",
-        "not_custom": "Встроенные песни удалять нельзя. Только свои: <code>.singdel 11</code>",
+        "not_custom": "Встроенные песни удалять нельзя. Только свои: <code>.singdel название</code>",
         "del_usage": "Удалить свою: <code>.singdel номер</code> или <code>.singdel название</code>",
     }
 
@@ -259,6 +772,7 @@ class SingMod(loader.Module):
                     "aliases": tuple(str(a) for a in aliases),
                     "lines": lines,
                     "custom": True,
+                    "genre": "custom",
                 }
             )
         return out
@@ -278,6 +792,10 @@ class SingMod(loader.Module):
         ]
         self.set("custom", payload)
 
+    def _by_genre(self, genre: str, catalog: Optional[Sequence[dict]] = None) -> List[dict]:
+        source = list(catalog) if catalog is not None else self._catalog()
+        return [song for song in source if _genre_of(song) == genre]
+
     def _find_song(self, query: str):
         catalog = self._catalog()
         raw = (query or "").strip().lower()
@@ -285,6 +803,13 @@ class SingMod(loader.Module):
             return None
         if raw in {"r", "rand", "random", "рандом", "случайная"}:
             return random.choice(catalog) if catalog else None
+        if raw in ROCK_QUERIES:
+            pool = [song for song in SONGS if song.get("genre") in ROCK_GENRES]
+            return random.choice(pool) if pool else None
+        genre = _match_genre(raw)
+        if genre:
+            pool = self._by_genre(genre, catalog)
+            return random.choice(pool) if pool else None
         if raw.isdigit():
             idx = int(raw)
             if 1 <= idx <= len(catalog):
@@ -305,6 +830,26 @@ class SingMod(loader.Module):
             title = head.strip()
             lines = [ln.strip() for ln in rest.splitlines() if ln.strip()]
         return title, lines
+
+    async def _lines_from_reply(self, reply: Message) -> List[str]:
+        if not reply:
+            return []
+        text = getattr(reply, "raw_text", None) or ""
+        if text.strip():
+            return [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not getattr(reply, "document", None):
+            return []
+        try:
+            data = await reply.download_media(bytes)
+        except Exception:
+            return []
+        if not data:
+            return []
+        try:
+            body = data.decode("utf-8")
+        except UnicodeDecodeError:
+            body = data.decode("cp1251", errors="replace")
+        return [ln.strip() for ln in body.splitlines() if ln.strip()]
 
     def _delay(self, line: str) -> float:
         try:
@@ -344,30 +889,44 @@ class SingMod(loader.Module):
             self._task = None
 
     def _list_text(self) -> str:
-        rows = []
-        for i, song in enumerate(self._catalog(), 1):
-            aliases = ", ".join(a for a in (song.get("aliases") or ()) if not str(a).isdigit())
+        catalog = self._catalog()
+        rows: List[str] = []
+        seen_groups = set()
+        for i, song in enumerate(catalog, 1):
+            genre = _genre_of(song)
+            if genre not in seen_groups:
+                seen_groups.add(genre)
+                rows.append(
+                    self.strings["group"].format(
+                        label=utils.escape_html(GENRE_LABELS.get(genre, genre))
+                    )
+                )
             mark = " · своя" if song.get("custom") else ""
             rows.append(
                 self.strings["item"].format(
                     idx=i,
                     title=utils.escape_html(song["title"]) + mark,
-                    aliases=utils.escape_html(aliases),
                 )
             )
-        return self.strings["list"].format("\n".join(rows))
+        return self.strings["list"].format("\n".join(rows).strip())
 
     @loader.command(
-        ru_doc="без аргументов — список; номер, название или random — спеть (одна строка на экране)",
+        ru_doc="без аргументов — список; номер, название, жанр (блюз/рок) или random — спеть",
     )
     async def sing(self, message: Message):
-        """без аргументов — список; номер, название или random — спеть (одна строка на экране)"""
+        """без аргументов — список; номер, название, жанр (блюз/рок) или random — спеть"""
         args = utils.get_args_raw(message).strip()
         if not args:
             await utils.answer(message, self._list_text())
             return
+        if args.lower() in RAP_QUERIES:
+            await utils.answer(message, self.strings["no_rap"])
+            return
         song = self._find_song(args)
         if not song:
+            if _match_genre(args) or args.lower() in ROCK_QUERIES:
+                await utils.answer(message, self.strings["no_genre"])
+                return
             await utils.answer(message, self.strings["unknown"])
             return
         if self._task and not self._task.done():
@@ -376,15 +935,14 @@ class SingMod(loader.Module):
         self._task = asyncio.create_task(self._sing(message, song))
 
     @loader.command(
-        ru_doc="<название> — добавить свою песню: реплай на текст или строки ниже названия",
+        ru_doc="<название> — своя песня: реплай на текст или .txt, либо строки ниже названия",
     )
     async def singadd(self, message: Message):
-        """<название> — добавить свою песню: реплай на текст или строки ниже названия"""
+        """<название> — своя песня: реплай на текст или .txt, либо строки ниже названия"""
         raw = utils.get_args_raw(message)
         title, lines = self._parse_lyrics(message, raw)
-        reply = await message.get_reply_message()
-        if reply and getattr(reply, "raw_text", None) and not lines:
-            lines = [ln.strip() for ln in reply.raw_text.splitlines() if ln.strip()]
+        if not lines:
+            lines = await self._lines_from_reply(await message.get_reply_message())
         if not title:
             await utils.answer(message, self.strings["add_usage"])
             return
