@@ -12,12 +12,13 @@ import logging
 from datetime import datetime
 from io import BytesIO
 
-from telethon.tl.types import Message, User
+from hikkatl.tl.types import Message, User
+from hikkatl.utils import resolve_id
 
-from telethon.tl.functions.messages import (
+from hikkatl.tl.functions.messages import (
     ReadDiscussionRequest,
 )
-from telethon.tl.functions.channels import (
+from hikkatl.tl.functions.channels import (
     GetForumTopicsRequest,
     CreateForumTopicRequest,
     ToggleForumRequest,
@@ -378,12 +379,8 @@ class LebedKAPMLogMod(loader.Module):
         (positive id without the -100 supergroup/channel prefix), so ids
         added by the user match ids seen in the watcher.
         """
-        s = str(chat_id)
-        if s.startswith("-100"):
-            return int(s[4:])
-        if s.startswith("-"):
-            return int(s[1:])
-        return chat_id
+        chat_id = int(chat_id)
+        return resolve_id(chat_id)[0] if chat_id < 0 else chat_id
 
     async def _resolve_target_ids(self, message: Message):
         args = utils.get_args_raw(message)
@@ -404,10 +401,64 @@ class LebedKAPMLogMod(loader.Module):
                     except Exception:
                         continue
             return targets
+        # In a group, reply commands operate on the group, not its author.
+        if message.is_group:
+            return [self._normalize_id(utils.get_chat_id(message))]
         reply = await message.get_reply_message()
-        if reply:
+        if reply and reply.sender_id is not None:
             return [self._normalize_id(reply.sender_id)]
         return [utils.get_chat_id(message)]
+
+    async def pmloggroupcmd(self, message: Message):
+        """Enable group logging and add this group; use without arguments."""
+        if not message.is_group:
+            await utils.answer(message, "Запустите команду в нужной группе.")
+            return
+        if utils.get_args_raw(message).strip():
+            await utils.answer(message, "Запустите .pmloggroup без аргументов в нужной группе.")
+            return
+        target = self._normalize_id(utils.get_chat_id(message))
+        if any(ch is not None and ch.id == target for ch in
+               (getattr(self, "c", None), getattr(self, "gc", None))):
+            await utils.answer(message, "Чат лога нельзя добавить в источники.")
+            return
+        # Create destination first, so an API failure leaves config intact.
+        await self._ensure_group_channel()
+        ids = list(dict.fromkeys(self._normalize_id(i) for i in
+                                (self.config["log_list"] or [])))
+        if target not in ids:
+            ids.append(target)
+        self.config["log_list"] = ids
+        self.config["log_groups"] = True
+        await utils.answer(message, "✅ Группа добавлена. Новые сообщения будут "
+                           "логироваться в [LebedKA] PMLogGroups.")
+
+    async def pmlogstatuscmd(self, message: Message):
+        """Show logging status and filtering reason for the current chat."""
+        chat_id = self._normalize_id(utils.get_chat_id(message))
+        listed = chat_id in {self._normalize_id(i) for i in
+                             (self.config["log_list"] or [])}
+        own_log = any(ch is not None and ch.id == chat_id for ch in
+                      (getattr(self, "c", None), getattr(self, "gc", None)))
+        if own_log:
+            reason = "Это чат лога: сообщения пропускаются для защиты от цикла."
+        elif message.is_group:
+            if not self.config["log_groups"]:
+                reason = "Логирование групп выключено. Включить: .pmloggroup"
+            elif not listed:
+                reason = "Группа отсутствует в списке. Добавить: .pmloggroup"
+            else:
+                reason = "Группа включена. Лог: [LebedKA] PMLogGroups."
+        elif message.is_private:
+            enabled = listed != bool(self.config["whitelist"])
+            reason = ("Личный чат разрешён фильтром." if enabled else
+                      "Личный чат исключён фильтром.")
+            reason += " Сообщения ботов: " + ("включены." if self.config["log_bots"] else "выключены.")
+        else:
+            reason = "Каналы не логируются; поддерживаются личные чаты и группы."
+        await utils.answer(message, "⚙️ <b>PMLog</b>\n" + reason +
+                           f"\nID чата: <code>{chat_id}</code>" +
+                           "\nПроверяется фильтр; доставка сообщений этим статусом не подтверждается.")
 
     async def pmlogaddcmd(self, message: Message):
         """
@@ -841,13 +892,24 @@ class LebedKAPMLogMod(loader.Module):
         if not isinstance(message, Message):
             return
 
-        chatidindb = utils.get_chat_id(message) in (self.config["log_list"] or [])
+        chat_id = self._normalize_id(utils.get_chat_id(message))
+        # Never feed log messages back into either log channel.
+        log_channels = (getattr(self, "c", None), getattr(self, "gc", None))
+        if any(ch is not None and chat_id == ch.id for ch in log_channels):
+            return
+        chatidindb = chat_id in {
+            self._normalize_id(i) for i in (self.config["log_list"] or [])
+        }
 
         if message.is_private:
             user = await message.get_sender()
+            if user is None:
+                return
             if user.id == self.tg_id:
                 user = await message.get_chat()
-            if (user.bot and not self.config["log_bots"]) or user.id == self.tg_id:
+            if user is None:
+                return
+            if (getattr(user, "bot", False) and not self.config["log_bots"]) or user.id == self.tg_id:
                 return
             if (
                 self.config["whitelist"]
@@ -858,8 +920,10 @@ class LebedKAPMLogMod(loader.Module):
                 return
             channel = self.c
             cache = self._topic_cache
-        elif self.config["log_groups"] and chatidindb:
+        elif message.is_group and self.config["log_groups"] and chatidindb:
             user = await message.get_chat()
+            if user is None:
+                return
             channel = await self._ensure_group_channel()
             cache = self._group_topic_cache
         else:
