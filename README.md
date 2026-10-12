@@ -23,3 +23,10 @@
 
 - Telegram: [@LebedKA_SYS](https://t.me/LebedKA_SYS)
 - Репозиторий: [troy9221/hikka_modules](https://github.com/troy9221/hikka_modules)
+
+## Встроенный модуль резервного копирования
+
+[HikkaBackup](README_MODULES/README_hikka_backup.md): настройки и код установленных
+модулей по расписанию в одну группу. Это обновление встроенного модуля для
+форка [troy9221/Hikka](https://github.com/troy9221/Hikka); установка через `.update`,
+инструкция ручной установки — по ссылке.
