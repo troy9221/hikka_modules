@@ -10,6 +10,7 @@
 import asyncio
 from copy import deepcopy
 import logging
+import importlib
 from datetime import datetime
 from io import BytesIO
 
@@ -225,6 +226,7 @@ class LebedKAPMLogMod(loader.Module):
         )
 
     async def client_ready(self):
+        logger.info("PMLog loaded: native-forum-forward-v3")
         self._topic_cache = {}
         self._group_topic_cache = {}
         self._topic_locks = {}
@@ -778,13 +780,13 @@ class LebedKAPMLogMod(loader.Module):
         )
         if read_max_id is None:
             return
-        await self._client(
-            ReadDiscussionRequest(
-                channel.id,
-                read_max_id,
-                2**31 - 1,
+        try:
+            await self._client(
+                ReadDiscussionRequest(channel.id, read_max_id, 2**31 - 1)
             )
-        )
+        except Exception as error:
+            # Marking read must never turn a successful forward into a copy.
+            logger.warning("PMLog mark-read failed: %s", type(error).__name__)
 
     @staticmethod
     def _message_payload(message: Message, prefix_html: str = "", suffix_html: str = ""):
@@ -883,6 +885,19 @@ class LebedKAPMLogMod(loader.Module):
         await self._mark_topic_read(msg, channel)
         return msg
 
+    async def _source_header(self, message: Message):
+        sender = await message.get_sender()
+        if sender is None:
+            return "<b>From:</b> Unknown sender\n"
+        name = (getattr(sender, "title", None) or
+                " ".join(filter(None, [getattr(sender, "first_name", None),
+                                       getattr(sender, "last_name", None)])) or
+                getattr(sender, "username", None) or str(sender.id))
+        name = utils.escape_html(name)
+        if isinstance(sender, User):
+            return f'<b>From:</b> <a href="tg://user?id={sender.id}">{name}</a>\n'
+        return f"<b>From:</b> {name}\n"
+
     async def _save_regular(self, user: User, message: Message, channel, cache: dict):
         """
         Fallback logger for messages that cannot be forwarded (e.g. content
@@ -890,6 +905,7 @@ class LebedKAPMLogMod(loader.Module):
         lost from the log.
         """
         topic_id = cache[user.id].id
+        header = await self._source_header(message)
         media = getattr(message, "media", None)
         if media is not None:
             file = BytesIO()
@@ -903,7 +919,20 @@ class LebedKAPMLogMod(loader.Module):
                 (message.file.name if message.file else None) or f"media{ext}"
             )
             file.seek(0)
-            caption, entities = self._message_payload(message)
+            caption, entities = self._message_payload(message, header)
+            document = getattr(message, "document", None)
+            media_options = {}
+            if document is not None:
+                media_options["attributes"] = deepcopy(document.attributes or [])
+                media_options["mime_type"] = document.mime_type
+
+            if getattr(message, "sticker", None):
+                context, context_entities = self._message_payload(message, header)
+                await self._client.send_message(
+                    channel.id, context, parse_mode=None,
+                    formatting_entities=context_entities, reply_to=topic_id,
+                )
+                caption, entities = "", []
             msg = await self._client.send_file(
                 channel.id,
                 file,
@@ -911,9 +940,10 @@ class LebedKAPMLogMod(loader.Module):
                 parse_mode=None,
                 formatting_entities=entities,
                 reply_to=topic_id,
+                **media_options,
             )
         else:
-            text, entities = self._message_payload(message)
+            text, entities = self._message_payload(message, header)
             msg = await self._client.send_message(
                 channel.id,
                 text,
@@ -923,6 +953,30 @@ class LebedKAPMLogMod(loader.Module):
             )
         await self._mark_topic_read(msg, channel)
         return msg
+
+    async def _forward_to_topic(self, message: Message, channel, topic_id: int):
+        # Use the TL API: Telethon's high-level forward_messages has no
+        # top_msg_id argument. Match the request class to the live client.
+        package = next(
+            base.__module__.split(".")[0]
+            for base in type(self._client).__mro__
+            if base.__module__.split(".")[0] in {"telethon", "hikkatl"}
+        )
+        requests = importlib.import_module(package + ".tl.functions.messages")
+        target = await self._client.get_input_entity(channel.id)
+        request = requests.ForwardMessagesRequest(
+            from_peer=await message.get_input_chat(),
+            id=[message.id], to_peer=target, top_msg_id=topic_id,
+            drop_author=False, drop_media_captions=False,
+        )
+        result = await self._client(request)
+        if not getattr(self, "_native_forward_confirmed", False):
+            logger.info("PMLog native forum forward succeeded")
+            self._native_forward_confirmed = True
+        response = self._client._get_response_message(request, result, target)
+        if isinstance(response, list):
+            return next((item for item in response if item is not None), None)
+        return response
 
     async def _queue_handler(self, message: Message):
         if not isinstance(message, Message):
@@ -998,10 +1052,9 @@ class LebedKAPMLogMod(loader.Module):
                     )
                 return
 
-            msg = await message.forward_to(
-                channel.id, top_msg_id=cache[user.id].id
-            )
-            await self._mark_topic_read(msg, channel)
+            msg = await self._forward_to_topic(message, channel, cache[user.id].id)
+            if msg is not None:
+                await self._mark_topic_read(msg, channel)
         except Exception as e:
             if is_self_destr:
                 if not self.config["log_self_destr"]:
@@ -1030,6 +1083,7 @@ class LebedKAPMLogMod(loader.Module):
                     )
                 return
 
+            logger.warning("PMLog forwarding fallback: %s: %s", type(e).__name__, str(e), exc_info=True)
             try:
                 if user.id not in cache:
                     async with self._get_topic_lock(channel, user.id):
