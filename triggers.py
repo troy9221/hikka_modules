@@ -763,6 +763,12 @@ class Triggers(loader.Module):
 
     async def client_ready(self):
         self.cache = _TriggerCooldown(ttl=float(self.config["throttle_time"]))
+        existing_ids = [t.get("id") for t in self.manager.get_triggers()
+                        if isinstance(t, dict) and type(t.get("id")) is int]
+        saved_next = self.get("next_trigger_id", 0)
+        if type(saved_next) is not int:
+            saved_next = 0
+        self.set("next_trigger_id", max(saved_next, max(existing_ids, default=-1) + 1))
         logger.info("Triggers menu v3 loaded; saved triggers: %d",
                     len(self.manager.get_triggers()))
 
