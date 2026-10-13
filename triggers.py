@@ -211,7 +211,7 @@ class TriggerManager:
         trigger = validate_trigger(trigger)
         response = self.get_trigger_with_index(trigger["id"])
         if not response:
-            return self.add_trigger(trigger)
+            raise ValueError("Trigger has been deleted; refresh the menu")
         i, t = response
         triggers = self.get_triggers()
         triggers[i] = trigger
@@ -219,49 +219,190 @@ class TriggerManager:
 
 
 class Configuration:
-    def __init__(self, manager: TriggerManager) -> None:
+    PAGE_SIZE = 8
+    ACTION_LABELS = {"answer": "Ответ", "delete": "Удаление сообщения",
+                     "invoke": "Команда", "callback": "Callback"}
+
+    def __init__(self, manager: TriggerManager, module=None, chat_id=None):
         self.manager = manager
+        self.module = module
+        self.chat_id = chat_id
+        self._page = 0
 
-    def _triggers_menu_markup(self, triggers: List[Trigger]) -> HikkaReplyMarkup:
-        if len(triggers) > 96:
-            triggers = triggers[:95]
-        butttons = [
-            {
-                "text": f"ID-{t['id']}",
-                "callback": self._open_trigger_config,
-                "kwargs": {"trigger": t},
-            }
-            for t in triggers
+    @staticmethod
+    def _preview(text, limit=52):
+        text = " ".join(str(text).split())
+        return text if len(text) <= limit else text[:limit - 1] + "…"
+
+    def _action_preview(self, trigger):
+        action = trigger.get("action", {})
+        data = action.get("data", {})
+        kind = action.get("type", "")
+        value = {"answer": data.get("text", ""), "invoke": data.get("command", ""),
+                 "callback": data.get("callback_id", "")}.get(kind, "")
+        label = self.ACTION_LABELS.get(kind, kind)
+        return label + (": " + self._preview(value, 80) if value else "")
+
+    def _menu(self, page=0):
+        triggers = sorted(self.manager.get_triggers(), key=lambda t: t["id"])
+        pages = max(1, (len(triggers) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        page = max(0, min(page, pages - 1))
+        self._page = page
+        selected = triggers[page * self.PAGE_SIZE:(page + 1) * self.PAGE_SIZE]
+        lines = ["<b>Триггеры</b>", "Выбери правило, чтобы посмотреть, изменить или удалить."]
+        if not triggers:
+            lines.append("\nСписок пуст. Создай первое правило кнопкой ниже.")
+        markup = []
+        for trigger in selected:
+            state = "🟢" if trigger.get("enabled", True) else "⚪"
+            pattern = self._preview(trigger["m"], 100)
+            lines.append(f"\n{state} <b>#{trigger['id']}</b> <code>{utils.escape_html(pattern)}</code>"
+                         f"\n{utils.escape_html(self._action_preview(trigger))}")
+            markup.append([{"text": f"{state} #{trigger['id']} · {self._preview(trigger['m'], 36)}",
+                            "callback": self._open_trigger_config,
+                            "kwargs": {"trigger": trigger}}])
+        if pages > 1:
+            nav = []
+            if page > 0:
+                nav.append({"text": "← Назад", "callback": self._open_triggers_menu,
+                            "kwargs": {"page": page - 1}})
+            if page + 1 < pages:
+                nav.append({"text": "Дальше →", "callback": self._open_triggers_menu,
+                            "kwargs": {"page": page + 1}})
+            markup.append(nav)
+            lines.append(f"\nСтраница {page + 1}/{pages}")
+        markup.append([{"text": "➕ Создать триггер", "input": "Введите текст, на который реагировать",
+                        "handler": self._create_trigger}])
+        if self.module is not None:
+            active = bool(self.module.config["status"])
+            markup.append([{"text": "Модуль: " + ("включён 🟢" if active else "выключен ⚪"),
+                            "callback": self._toggle_module}])
+            if self.chat_id is not None:
+                included = self.chat_id in self.module.get("chats", [])
+                markup.append([{"text": ("Убрать текущий чат" if included else "Добавить текущий чат"),
+                                "callback": self._toggle_chat}])
+        markup.append([{"text": "Обновить", "callback": self._open_triggers_menu,
+                        "kwargs": {"page": page}},
+                       {"text": "Закрыть", "action": "close"}])
+        return "\n".join(lines), markup
+
+    def _trigger_config_markup(self, trigger):
+        enabled = trigger.get("enabled", True)
+        rows = [
+            [{"text": "Выключить" if enabled else "Включить",
+              "callback": self._toggle_rule, "kwargs": {"trigger": trigger}},
+             {"text": "🗑 Удалить", "callback": self._confirm_delete,
+              "kwargs": {"trigger": trigger}}],
+            [self._input_button(trigger, "m", "Текст триггера"),
+             self._input_button(trigger, "delay", "Задержка")],
         ]
+        if trigger["action"]["type"] == "answer":
+            rows.append([self._input_button(trigger, "action.data.text", "Текст ответа")])
+        rows.extend([
+            [{"text": "Фильтры", "callback": self._open_filters_config_menu,
+              "kwargs": {"trigger": trigger}},
+             {"text": "Действие", "callback": self._open_action_config_menu,
+              "kwargs": {"trigger": trigger}}],
+            [{"text": "← К списку", "callback": self._open_triggers_menu,
+              "kwargs": {"page": self._page}}],
+        ])
+        return rows
 
-        return utils.chunks(butttons, 3)
+    def _trigger_config_text(self, trigger):
+        state = "включён" if trigger.get("enabled", True) else "выключен"
+        pattern = utils.escape_html(str(trigger["m"])[:1200])
+        action = trigger["action"]
+        data = action.get("data", {})
+        detail = {"answer": data.get("text", ""), "invoke": data.get("command", "") + " " + data.get("args", ""),
+                  "callback": data.get("callback_id", "")}.get(action["type"], "")
+        filters = trigger.get("filters", {})
+        lines = [f"<b>Триггер #{trigger['id']}</b> · {state}", f"\n<b>Реагирует на:</b>\n<code>{pattern}</code>",
+                 f"\n<b>Действие:</b> {self.ACTION_LABELS.get(action['type'], action['type'])}"]
+        if detail:
+            lines.append(utils.escape_html(str(detail)[:1200]))
+        elif action["type"] == "answer":
+            lines.append("<i>Текст ответа ещё не задан</i>")
+        lines.append(f"\n<b>Задержка:</b> {trigger.get('delay', 0)} с")
+        flags = []
+        if filters.get("ignorecase"): flags.append("без учёта регистра")
+        if filters.get("contains"): flags.append("по части сообщения")
+        if filters.get("is_admin"): flags.append("только администраторы")
+        for key, title in (("from_users", "авторы"), ("chats", "чаты")):
+            if key in filters:
+                flags.append(title + ": " + str(filters[key]))
+        lines.append("<b>Фильтры:</b> " + utils.escape_html(self._preview(", ".join(flags), 600) if flags else "без ограничений"))
+        return "\n".join(lines)
 
-    def _main_menu_markup(self) -> HikkaReplyMarkup:
-        return [
-            [{"text": "🔀 Triggers", "callback": self._open_triggers_menu}],
-            [{"text": "❌ Close", "action": "close"}],
-        ]
+    async def _toggle_module(self, call):
+        self.module.config["status"] = not self.module.config["status"]
+        await self._open_triggers_menu(call, self._page)
 
-    def _trigger_config_markup(self, trigger: Trigger) -> HikkaReplyMarkup:
-        buttons = [
-            self._input_button(trigger, "m", "message"),
-            self._input_button(trigger, "delay", "delay"),
-            {
-                "text": "🛡 Filters",
-                "callback": self._open_filters_config_menu,
-                "kwargs": {"trigger": trigger},
-            },
-            {
-                "text": "💊 Action",
-                "callback": self._open_action_config_menu,
-                "kwargs": {"trigger": trigger},
-            },
-            {
-                "text": "⬅️ Back",
-                "callback": self._open_triggers_menu,
-            },
-        ]
-        return utils.chunks(buttons, 2)
+    async def _toggle_chat(self, call):
+        chats = list(self.module.get("chats", []))
+        if self.chat_id in chats:
+            chats.remove(self.chat_id)
+        else:
+            chats.append(self.chat_id)
+        self.module.set("chats", chats)
+        await self._open_triggers_menu(call, self._page)
+
+    async def _create_trigger(self, call, query):
+        if not query.strip():
+            await call.answer("Текст триггера не может быть пустым")
+            return
+        if self.module is None:
+            await call.answer("Открой меню заново через .tmenu")
+            return
+        trigger = {"id": self.module.increment_trigger_id(), "m": query,
+                   "enabled": False, "delay": 0, "filters": {},
+                   "action": {"type": "answer", "data": {"text": ""}}}
+        self.manager.add_trigger(trigger)
+        await self._open_trigger_config(call, trigger)
+
+    async def _toggle_rule(self, call, trigger):
+        current = self.manager.get_trigger(trigger["id"])
+        if current is None:
+            await call.answer("Этот триггер уже удалён")
+            await self._open_triggers_menu(call, self._page)
+            return
+        enabled = not current.get("enabled", True)
+        required = {"answer": "text", "invoke": "command", "callback": "callback_id"}.get(current["action"]["type"])
+        if enabled and required and not current["action"].get("data", {}).get(required):
+            await call.answer("Сначала задай данные действия")
+            return
+        current["enabled"] = enabled
+        self.manager.set_trigger(current)
+        await self._open_trigger_config(call, current)
+
+    async def _confirm_delete(self, call, trigger):
+        current = self.manager.get_trigger(trigger["id"])
+        if current is None:
+            await call.answer("Этот триггер уже удалён")
+            await self._open_triggers_menu(call, self._page)
+            return
+        expected = json.dumps(current, sort_keys=True, ensure_ascii=False)
+        await call.edit(
+            text="<b>Удалить этот триггер?</b>\n\n" + self._trigger_config_text(current),
+            reply_markup=[
+                [{"text": "🗑 Да, удалить #" + str(current["id"]), "callback": self._delete_trigger,
+                  "kwargs": {"trigger_id": current["id"], "expected": expected}}],
+                [{"text": "Отмена", "callback": self._open_trigger_config,
+                  "kwargs": {"trigger": current}}],
+            ],
+        )
+
+    async def _delete_trigger(self, call, trigger_id, expected):
+        current = self.manager.get_trigger(trigger_id)
+        if current is None:
+            await call.answer("Этот триггер уже удалён")
+        elif json.dumps(current, sort_keys=True, ensure_ascii=False) != expected:
+            await call.answer("Правило изменилось. Проверь его перед удалением.")
+            await self._confirm_delete(call, current)
+            return
+        else:
+            self.manager.set_triggers([t for t in self.manager.get_triggers() if t["id"] != trigger_id])
+            await call.answer("Триггер #" + str(trigger_id) + " удалён")
+        await self._open_triggers_menu(call, self._page)
 
     def _trigger_filters_markup(self, trigger: Trigger) -> HikkaReplyMarkup:
         types = Filters.__annotations__.items()
@@ -284,27 +425,21 @@ class Configuration:
 
         return f
 
-    def _bool_filter_config(self, trigger: Trigger, key: str) -> HikkaReplyMarkup:
-        async def callback(call: InlineCall) -> None:
-            val: Optional[bool] = trigger["filters"].get(key)
-            if val is None:
-                await call.answer("error: filter not found")
+    def _bool_filter_config(self, trigger, key):
+        labels = {"ignorecase": "Без учёта регистра", "contains": "По части текста",
+                  "is_admin": "Только администраторы"}
+        trigger_id = trigger["id"]
+        async def callback(call):
+            current = self.manager.get_trigger(trigger_id)
+            if current is None:
+                await call.answer("Этот триггер уже удалён")
+                await self._open_triggers_menu(call, self._page)
                 return
-            trigger["filters"][key] = not val
-            self.manager.set_trigger(trigger)
-            await call.answer("✅")
-            await self._open_filters_config_menu(call, trigger)
-
-        v: Optional[bool] = trigger["filters"].get(key)
-        if v is None:
-            trigger["filters"][key] = False
-
-        return [
-            {
-                "text": f"{'❌' if not v else '✅'} {key}",
-                "callback": callback,
-            }
-        ]
+            current["filters"][key] = not current["filters"].get(key, False)
+            self.manager.set_trigger(current)
+            await self._open_filters_config_menu(call, current)
+        state = "✅" if trigger["filters"].get(key, False) else "⚪"
+        return [{"text": state + " " + labels.get(key, key), "callback": callback}]
 
     def _list_int_filter_config(self, trigger: Trigger, key: str) -> HikkaReplyMarkup:
         async def callback(call: InlineCall, query: str, action: str) -> None:
@@ -396,7 +531,7 @@ class Configuration:
 
         return [
             {
-                "text": f"{key} - list[int]",
+                "text": {"from_users": "Авторы (ID)", "chats": "Чаты (ID)"}.get(key, key),
                 "callback": open_configuration,
             }
         ]
@@ -406,7 +541,7 @@ class Configuration:
     ) -> HikkaReplyMarkup:
         return {
             "text": f"✍️ {title.capitalize()}",
-            "input": f"✍️ Enter new value for '{title}'",
+            "input": f"Введите новое значение: {title}",
             "handler": self._update_trigger_input_handler,
             "kwargs": {
                 "path": path,
@@ -414,12 +549,14 @@ class Configuration:
             },
         }
 
-    def _trigger_config_text(self, trigger: Trigger) -> str:
-        return f"🛠 <b>Editing trigger with id {trigger['id']}</b>\n\n<code>{utils.escape_html(str(trigger))}</code>"
-
     async def _update_trigger_input_handler(
         self, call: InlineCall, query: str, path: str, trigger: Trigger
     ) -> None:
+        trigger = self.manager.get_trigger(trigger["id"])
+        if trigger is None:
+            await call.answer("Этот триггер уже удалён")
+            await self._open_triggers_menu(call, self._page)
+            return
         try:
             val = dict_getter(trigger, path)
         except ValueError:
@@ -443,7 +580,7 @@ class Configuration:
         self, call: InlineCall, trigger: Trigger
     ) -> None:
         markup = self._trigger_filters_markup(trigger)
-        await call.edit(text="⚙️ <b>Filter configuration</b>", reply_markup=markup)
+        await call.edit(text="⚙️ <b>Настройки фильтров</b>", reply_markup=markup)
 
     async def __change_action_type(
         self, call: InlineCall, val: str, trigger: Trigger
@@ -451,7 +588,15 @@ class Configuration:
         if val not in ACTION_TYPES:
             await call.answer("error")
             return
-        trigger["action"]["type"] = val
+        trigger = self.manager.get_trigger(trigger["id"])
+        if trigger is None:
+            await call.answer("Этот триггер уже удалён")
+            return
+        if trigger["action"]["type"] != val:
+            defaults = {"answer": {"text": ""}, "delete": {},
+                        "invoke": {"command": "", "args": ""}, "callback": {"callback_id": ""}}
+            trigger["action"] = {"type": val, "data": defaults[val]}
+            trigger["enabled"] = False
         self.manager.set_trigger(trigger)
         await call.answer("✅")
         await self._open_action_type_config_menu(call, trigger)
@@ -480,7 +625,7 @@ class Configuration:
             ]
         )
 
-        await call.edit("⚙️ <b>Select action type:</b>", reply_markup=markup)
+        await call.edit("⚙️ <b>Выберите действие:</b>", reply_markup=markup)
 
     async def _open_action_config_menu(
         self, call: InlineCall, trigger: Trigger
@@ -503,36 +648,30 @@ class Configuration:
             ],
         ]
         await call.edit(
-            text=f"⚙️ <b>Action configuration</b>\n<code>{utils.escape_html(str(trigger['action']))}</code>",
+            text=f"⚙️ <b>Настройки действия</b>\n<code>{utils.escape_html(str(trigger['action']))}</code>",
             reply_markup=markup,
         )
 
-    async def _open_triggers_menu(self, call: InlineCall) -> None:
-        triggers = self.manager.get_triggers()
-        markup = self._triggers_menu_markup(triggers)
-
-        await call.edit(
-            text="☰ <b>Select trigger to configure:</b>", reply_markup=markup
-        )
+    async def _open_triggers_menu(self, call: InlineCall, page=0):
+        text, markup = self._menu(page)
+        await call.edit(text=text, reply_markup=markup)
 
     async def _open_trigger_config(self, call: InlineCall, trigger: Trigger):
-        markup = self._trigger_config_markup(trigger)
-        await call.edit(text=self._trigger_config_text(trigger), reply_markup=markup)
+        current = self.manager.get_trigger(trigger["id"])
+        if current is None:
+            await call.answer("Этот триггер уже удалён")
+            await self._open_triggers_menu(call, self._page)
+            return
+        await call.edit(text=self._trigger_config_text(current),
+                        reply_markup=self._trigger_config_markup(current))
 
-    async def render_specified_trigger(self, form: Any, message: Message, trigger: Trigger) -> None:
-        markup = self._trigger_config_markup(trigger)
-        await form(
-            text=self._trigger_config_text(trigger),
-            message=message,
-            reply_markup=markup
-        )
+    async def render_specified_trigger(self, form, message, trigger):
+        return await form(text=self._trigger_config_text(trigger), message=message,
+                          reply_markup=self._trigger_config_markup(trigger), force_me=True)
 
-    async def render(self, form: Any, message: Message) -> None:
-        await form(
-            text="⚙️ <b>Triggers Configuration Menu</b>",
-            message=message,
-            reply_markup=self._main_menu_markup(),
-        )
+    async def render(self, form, message):
+        text, markup = self._menu()
+        return await form(text=text, message=message, reply_markup=markup, force_me=True)
 
 
 @loader.tds
@@ -624,12 +763,15 @@ class Triggers(loader.Module):
 
     async def client_ready(self):
         self.cache = _TriggerCooldown(ttl=float(self.config["throttle_time"]))
-        logger.info("Triggers v2 loaded; saved triggers: %d",
+        logger.info("Triggers menu v3 loaded; saved triggers: %d",
                     len(self.manager.get_triggers()))
 
     def increment_trigger_id(self) -> int:
         triggers: List[Trigger] = self.get("triggers", [])
-        return max((t.get("id", -1) for t in triggers), default=-1) + 1
+        candidate = max((t.get("id", -1) for t in triggers), default=-1) + 1
+        candidate = max(candidate, self.get("next_trigger_id", 0))
+        self.set("next_trigger_id", candidate + 1)
+        return candidate
 
     async def _execute_callback(
         self, callback_id: str, message: Message, trigger: Trigger
@@ -758,10 +900,16 @@ class Triggers(loader.Module):
 
         await utils.answer(message, text)
 
+    @loader.command()
+    async def tmenu(self, message: Message):
+        """Открыть меню триггеров: просмотр, создание, изменение и удаление."""
+        config = Configuration(self.manager, self, utils.get_chat_id(message))
+        await config.render(self.inline.form, message)
+
     @loader.command(ru_doc="[необязятельно: айди триггера] - Конфиг модуля")
     async def tconfig(self, message: Message):
         """[optional: trigger id] - Triggers config."""
-        config = Configuration(self.manager)
+        config = Configuration(self.manager, self, utils.get_chat_id(message))
         args = utils.get_args(message)
         if len(args) < 1 or not args[0].isdigit():
             await config.render(self.inline.form, message)
