@@ -20,6 +20,8 @@ import ast
 import logging
 import asyncio
 import json
+import math
+from copy import deepcopy
 from contextlib import suppress
 from typing import Dict, List, TypedDict, Any, Callable, Optional, Tuple, Union
 from meval import meval
@@ -97,6 +99,55 @@ class Trigger(TypedDict):
     delay: float
 
 
+def validate_trigger(value):
+    if not isinstance(value, dict):
+        raise ValueError("Trigger must be a JSON object")
+    trigger = deepcopy(value)
+    if not isinstance(trigger.get("m"), str) or not trigger["m"]:
+        raise ValueError("m must be a non-empty string")
+    action = trigger.get("action")
+    if not isinstance(action, dict) or action.get("type") not in ACTION_TYPES:
+        raise ValueError("action.type must be answer, delete, invoke or callback")
+    data = action.setdefault("data", {})
+    if not isinstance(data, dict):
+        raise ValueError("action.data must be an object")
+    required = {"answer": "text", "invoke": "command", "callback": "callback_id"}.get(action["type"])
+    if required and not isinstance(data.get(required), str):
+        raise ValueError("action.data." + required + " must be a string")
+    if action["type"] == "invoke" and not isinstance(data.get("args", ""), str):
+        raise ValueError("action.data.args must be a string")
+    filters = trigger.setdefault("filters", {})
+    if not isinstance(filters, dict):
+        raise ValueError("filters must be an object")
+    for key in ("ignorecase", "contains", "is_admin"):
+        if key in filters and not isinstance(filters[key], bool):
+            raise ValueError("filters." + key + " must be true/false")
+    for key in ("from_users", "chats"):
+        if key in filters and (not isinstance(filters[key], list) or
+                any(type(i) is not int for i in filters[key])):
+            raise ValueError("filters." + key + " must be a list of integer IDs")
+    delay = trigger.setdefault("delay", 0)
+    if type(delay) not in (int, float) or not math.isfinite(delay) or delay < 0:
+        raise ValueError("delay must be a finite non-negative number")
+    if not isinstance(trigger.setdefault("enabled", True), bool):
+        raise ValueError("enabled must be true/false")
+    if type(trigger.get("id")) is not int or trigger["id"] < 0:
+        raise ValueError("id must be a non-negative integer")
+    return trigger
+
+
+def parse_value(current, raw):
+    if isinstance(current, str):
+        return raw
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        try:
+            return ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            return raw
+
+
 def dict_updater(obj: Dict[str, Union[dict, Any]], query: str, value: Any) -> None:
     keys = query.split(".")
     current = obj
@@ -105,10 +156,8 @@ def dict_updater(obj: Dict[str, Union[dict, Any]], query: str, value: Any) -> No
             raise ValueError(f"key {key} not found")
         current = current[key]
 
-    if not isinstance(current, dict) or keys[-1] not in current:
+    if not isinstance(current, dict):
         raise ValueError(f"key {keys[-1]} not found")
-    if not isinstance(current[keys[-1]], type(value)):
-        raise ValueError(f"value in dict must be the same type as value")
     current[keys[-1]] = value
 
 
@@ -120,6 +169,8 @@ def dict_getter(obj: Dict[str, Union[dict, Any]], query: str) -> Any:
             raise ValueError(f"key {key} not found")
         current = current[key]
 
+    if not isinstance(current, dict):
+        raise ValueError("Path does not point to an object")
     return current.get(keys[-1])
 
 
@@ -133,7 +184,7 @@ class TriggerManager:
         self.setter = setter_func
 
     def get_triggers(self) -> List[Trigger]:
-        return self.getter("triggers", [])
+        return deepcopy(self.getter("triggers", []))
 
     def get_trigger(self, t_id: int) -> Optional[Trigger]:
         triggers = self.get_triggers()
@@ -148,14 +199,16 @@ class TriggerManager:
                 return i, t
 
     def set_triggers(self, value: List[Trigger]) -> bool:
-        return self.setter("triggers", value)
+        return self.setter("triggers", deepcopy(value))
 
     def add_trigger(self, value: Trigger) -> bool:
+        value = validate_trigger(value)
         triggers = self.get_triggers()
         triggers.append(value)
         return self.set_triggers(triggers)
 
     def set_trigger(self, trigger: Trigger) -> bool:
+        trigger = validate_trigger(trigger)
         response = self.get_trigger_with_index(trigger["id"])
         if not response:
             return self.add_trigger(trigger)
@@ -373,19 +426,12 @@ class Configuration:
             await call.answer("error")
             return
 
-        if val is None:
-            with suppress(Exception):
-                value = ast.literal_eval(query)
-        else:
-            if not isinstance(val, str):
-                value = ast.literal_eval(query)
-            else:
-                value = query
-
         try:
+            value = parse_value(val, query)
             dict_updater(trigger, path, value)
             self.manager.set_trigger(trigger)
-        except ValueError:
+        except (ValueError, TypeError, KeyError, SyntaxError) as error:
+            await call.answer(str(error)[:180])
             return
 
         await call.edit(
@@ -523,7 +569,7 @@ class Triggers(loader.Module):
         "_cfg_status": "Модуль работает или нет",
         "_cfg_allow_invoke": "могут ли триггеры запускать ЛЮБЫЕ команды юзербота?",
         "_cfg_allow_callback": "могут ли триггеры запускать АБСОЛЮТНО любой код на python?",
-        "_cfg_throttle_time": "Кд между выполнением триггеров. Для применения изменений требуется перезагрузить модуль/юзербота",
+        "_cfg_throttle_time": "Пауза между выполнением триггеров. Изменения применяются сразу.",
         "no_reply": "<emoji document_id=5210952531676504517>❌</emoji> Нет реплая!",
         "no_args": "<emoji document_id=5210952531676504517>❌</emoji> Нет аргументов!",
         "text_add": (
@@ -578,15 +624,12 @@ class Triggers(loader.Module):
 
     async def client_ready(self):
         self.cache = _TriggerCooldown(ttl=float(self.config["throttle_time"]))
-        logger.info("Triggers compatibility module loaded; saved triggers: %d",
+        logger.info("Triggers v2 loaded; saved triggers: %d",
                     len(self.manager.get_triggers()))
 
     def increment_trigger_id(self) -> int:
         triggers: List[Trigger] = self.get("triggers", [])
-        if triggers:
-            return triggers[-1]["id"] + 1
-
-        return 0
+        return max((t.get("id", -1) for t in triggers), default=-1) + 1
 
     async def _execute_callback(
         self, callback_id: str, message: Message, trigger: Trigger
@@ -659,19 +702,15 @@ class Triggers(loader.Module):
             await utils.answer(message, self.strings("no_args"))
             return
 
-        trigger = json.loads(args)
-        if (
-            not isinstance(trigger, dict)
-            or not trigger.get("m")
-            or not trigger.get("action")
-            or not trigger.get("filters")
-        ):
+        try:
+            trigger = json.loads(args)
+            if not isinstance(trigger, dict):
+                raise ValueError("Trigger must be a JSON object")
+            trigger["id"] = self.increment_trigger_id()
+            self.manager.add_trigger(validate_trigger(trigger))
+        except (ValueError, TypeError, KeyError) as error:
+            await utils.answer(message, self.strings("error").format(e=utils.escape_html(str(error))))
             return
-
-        trigger["id"] = self.increment_trigger_id()
-        if not trigger.get("delay") or trigger["delay"] < 0:
-            trigger["delay"] = 0
-        self.manager.add_trigger(trigger)
 
         text = self.strings("text_add").format(id=trigger["id"])
 
@@ -688,7 +727,7 @@ class Triggers(loader.Module):
             t = self.strings("empty")
         else:
             for trigger in triggers:
-                t += f"  • {trigger['m']} {trigger['id']} action={trigger['action']['type'].lower()};\n"
+                t += f"  • {utils.escape_html(trigger['m'])} {trigger['id']} action={trigger['action']['type'].lower()} enabled={trigger.get('enabled', True)};\n"
 
         text = self.strings("text_all").format(
             triggers=t, chats=len(self.get("chats", []))
@@ -747,7 +786,7 @@ class Triggers(loader.Module):
 
         if not args[0].isdigit():
             await utils.answer(
-                message, self.strings("error").format("Input id must be an integer")
+                message, self.strings("error").format(e="Input id must be an integer")
             )
             return
 
@@ -792,13 +831,13 @@ class Triggers(loader.Module):
 
         if not args[0].isdigit():
             await utils.answer(
-                message, self.strings("error").format("Input id must be an integer")
+                message, self.strings("error").format(e="Input id must be an integer")
             )
             return
 
         trigger = self.manager.get_trigger(int(args[0]))
         if trigger:
-            await utils.answer(message, f"<code>{trigger}</code>")
+            await utils.answer(message, "<code>" + utils.escape_html(json.dumps(trigger, ensure_ascii=False)) + "</code>")
             return
 
         await utils.answer(message, self.strings("not_found"))
@@ -818,7 +857,7 @@ class Triggers(loader.Module):
 
         if not args[0].isdigit():
             await utils.answer(
-                message, self.strings("error").format("Input id must be an integer")
+                message, self.strings("error").format(e="Input id must be an integer")
             )
             return
         trigger_id = int(args[0])
@@ -829,19 +868,12 @@ class Triggers(loader.Module):
 
         try:
             new_trigger = json.loads(args[1])
-            keys = new_trigger.keys()
-            if not isinstance(new_trigger, dict) or not any(k in keys for k in keys):
-                raise ValueError(
-                    "trigger must be in JSON format and must have 'm' and 'action'"
-                )
-
+            if not isinstance(new_trigger, dict):
+                raise ValueError("Trigger must be a JSON object")
             new_trigger["id"] = trigger["id"]
-            if not new_trigger.get("delay") or new_trigger["delay"] < 0:
-                new_trigger["delay"] = 0
-
-            self.manager.set_trigger(new_trigger)
+            self.manager.set_trigger(validate_trigger(new_trigger))
         except Exception as e:
-            await utils.answer(message, self.strings("error").format(e=e))
+            await utils.answer(message, self.strings("error").format(e=utils.escape_html(str(e))))
             return
 
         await utils.answer(message, self.strings("success"))
@@ -858,7 +890,7 @@ class Triggers(loader.Module):
             return
         if not args[0].isdigit():
             await utils.answer(
-                message, self.strings("error").format("Input id must be an integer")
+                message, self.strings("error").format(e="Input id must be an integer")
             )
             return
 
@@ -870,103 +902,92 @@ class Triggers(loader.Module):
         path = args[1]
         value = args[2]
         try:
-            tvalue = dict_getter(trigger, "value")
-        except Exception as e:
-            await utils.answer(message, self.strings("error").format(e=e))
-            return
-        if tvalue is None:
-            with suppress(Exception):
-                value = ast.literal_eval(value)
-        else:
-            if not isinstance(tvalue, str):
-                value = ast.literal_eval(tvalue)
-
-        try:
+            current = dict_getter(trigger, path)
+            value = parse_value(current, value)
+            if path == "id":
+                raise ValueError("Trigger ID cannot be changed")
             dict_updater(trigger, path, value)
-            self.manager.set_trigger(trigger)
-        except Exception as e:
-            await utils.answer(message, self.strings("error").format(e=e))
+            self.manager.set_trigger(validate_trigger(trigger))
+        except (ValueError, TypeError, KeyError, SyntaxError) as error:
+            await utils.answer(message, self.strings("error").format(e=utils.escape_html(str(error))))
             return
 
         await utils.answer(message, self.strings("success"))
 
-    @loader.watcher()
+    @loader.command(alias="ton")
+    async def triggeron(self, message: Message):
+        """<id> Enable one trigger."""
+        await self._toggle_trigger(message, True)
+
+    @loader.command(alias="toff")
+    async def triggeroff(self, message: Message):
+        """<id> Disable one trigger without deleting it."""
+        await self._toggle_trigger(message, False)
+
+    async def _toggle_trigger(self, message, enabled):
+        raw = utils.get_args_raw(message).strip()
+        if not raw.isdigit():
+            await utils.answer(message, self.strings("error").format(e="Expected trigger ID"))
+            return
+        trigger = self.manager.get_trigger(int(raw))
+        if trigger is None:
+            await utils.answer(message, self.strings("not_found"))
+            return
+        trigger["enabled"] = enabled
+        try:
+            self.manager.set_trigger(trigger)
+        except (ValueError, TypeError, KeyError) as error:
+            await utils.answer(message, self.strings("error").format(e=utils.escape_html(str(error))))
+            return
+        await utils.answer(message, self.strings("success"))
+
+    @loader.watcher(only_messages=True)
     async def triggers_handler(self, message: Message):
         if not self.config["status"]:
             return
-
-        text = getattr(message, "raw_text", None) or message.text
+        text = getattr(message, "raw_text", None) or getattr(message, "text", None)
         if not text:
             return
-
-        chats = self.get("chats", [])
         chat_id = utils.get_chat_id(message)
-        if chat_id not in chats:
+        if chat_id not in self.get("chats", []):
             return
-
-        triggers = self.manager.get_triggers()
-        if not triggers:
-            return
-
-        t = []
-        for trigger in triggers:
-            if (
-                trigger["filters"].get("chats") is not None
-                and chat_id not in trigger["filters"]["chats"]
-            ):
-                continue
-            if (
-                trigger["filters"].get("from_users") is not None
-                and message.sender_id not in trigger["filters"]["from_users"]
-            ):
-                continue
-
-            match_text = text
-            match_pattern = trigger["m"]
-            if trigger["filters"].get("ignorecase"):
-                match_text = match_text.casefold()
-                match_pattern = match_pattern.casefold()
-
-            if match_text == match_pattern:
-                t.append(trigger)
-                continue
-
-            if trigger["filters"].get("contains") and match_pattern in match_text:
-                t.append(trigger)
-
-        for trigger in t:
-            if trigger["id"] in self.cache:
-                continue
-            else:
-                self.cache[trigger["id"]] = None
-
-            action_type = trigger["action"]["type"]
-            if trigger["delay"] != 0:
-                await asyncio.sleep(trigger["delay"])
-
-            if action_type == "answer":
-                await message.reply(
-                    trigger["action"]["data"]["text"].format(text=text)
-                )
-            elif action_type == "delete":
-                await message.delete()
-            elif action_type == "invoke":
-                if self.config["allow_invoke"]:
-                    await self.invoke(
-                        trigger["action"]["data"].get("command"),
-                        trigger["action"]["data"].get("args", ""),
-                        message=message,
-                    )
-            elif action_type == "callback":
-                if self.config["allow_callback"]:
-                    callback_id = trigger["action"].get("data", {}).get("callback_id")
-                    if not callback_id:
-                        logger.warning(
-                            "callback_id not set in trigger %s", trigger["id"]
-                        )
+        ttl = float(self.config["throttle_time"])
+        if self.cache.ttl != ttl:
+            self.cache = _TriggerCooldown(ttl=ttl)
+        for stored in self.manager.get_triggers():
+            try:
+                trigger = validate_trigger(stored)
+                if not trigger["enabled"]:
+                    continue
+                filters = trigger["filters"]
+                if "chats" in filters and chat_id not in filters["chats"]:
+                    continue
+                if "from_users" in filters and message.sender_id not in filters["from_users"]:
+                    continue
+                pattern, candidate = trigger["m"], text
+                if filters.get("ignorecase"):
+                    pattern, candidate = pattern.casefold(), candidate.casefold()
+                if candidate != pattern and not (filters.get("contains") and pattern in candidate):
+                    continue
+                if filters.get("is_admin"):
+                    if not getattr(message, "is_group", False) or message.sender_id is None:
                         continue
-                    await self._execute_callback(callback_id, message, trigger)
-            else:
-                logger.error(
-                    f"unknown action type {action_type} of trigger {trigger['id']}"
-                )
+                    permissions = await self._client.get_permissions(await message.get_chat(), message.sender_id)
+                    if not (permissions.is_admin or permissions.is_creator):
+                        continue
+                if trigger["id"] in self.cache:
+                    continue
+                self.cache[trigger["id"]] = None
+                if trigger["delay"]:
+                    await asyncio.sleep(trigger["delay"])
+                action = trigger["action"]
+                if action["type"] == "answer":
+                    await message.reply(action["data"]["text"].replace("{text}", utils.escape_html(text)))
+                elif action["type"] == "delete":
+                    await message.delete()
+                elif action["type"] == "invoke" and self.config["allow_invoke"]:
+                    await self.invoke(action["data"]["command"], action["data"].get("args", ""), message=message)
+                elif action["type"] == "callback" and self.config["allow_callback"]:
+                    await self._execute_callback(action["data"]["callback_id"], message, trigger)
+            except Exception as error:
+                logger.warning("Triggers: rule %s failed (%s)", stored.get("id", "unknown") if isinstance(stored, dict) else "unknown", type(error).__name__)
