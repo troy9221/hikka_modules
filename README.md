@@ -6,6 +6,7 @@
 
 | Модуль | Описание | Установка |
 |--------|----------|-----------|
+| [**Triggers**](README_MODULES/README_triggers.md) | Триггеры ответов и действий; совместимая версия модуля @sqlmerr_m | `.dlmod https://raw.githubusercontent.com/troy9221/hikka_modules/main/triggers.py` |
 | [**LebedKA-PMLog**](README_MODULES/README_lebedka_pmlog.md) | Логирование личных сообщений (PM) в форум-чат с топиками по каждому пользователю | `.dlmod https://raw.githubusercontent.com/troy9221/hikka_modules/main/lebedka_pmlog.py` |
 | [**YG Quotes**](README_MODULES/README_fq.md) | Создание красивых цитат из сообщений — реальных и фейковых | `.dlmod https://raw.githubusercontent.com/troy9221/hikka_modules/main/fq.py` |
 | [**Just Leave**](README_MODULES/README_leave.md) | Быстрый выход из группы/канала с прощальным сообщением | `.dlmod https://raw.githubusercontent.com/troy9221/hikka_modules/main/leave.py` |
