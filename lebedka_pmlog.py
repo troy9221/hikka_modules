@@ -8,12 +8,14 @@
 # scope: hikka_min 1.3.3
 
 import asyncio
+from copy import deepcopy
 import logging
 from datetime import datetime
 from io import BytesIO
 
 from hikkatl.tl.types import Message, User
 from hikkatl.utils import resolve_id
+from hikkatl.extensions import html
 
 from hikkatl.tl.functions.messages import (
     ReadDiscussionRequest,
@@ -784,6 +786,28 @@ class LebedKAPMLogMod(loader.Module):
             )
         )
 
+    @staticmethod
+    def _message_payload(message: Message, prefix_html: str = "", suffix_html: str = ""):
+        """Keep raw text and Telegram entities; never parse user text as HTML."""
+        raw = message.raw_text or ""
+        entities = deepcopy(message.entities or [])
+        def parse_affix(value):
+            # html.parse strips whitespace. Sentinels preserve banner newlines.
+            text, parsed_entities = html.parse("x" + value + "x")
+            for entity in parsed_entities:
+                entity.offset -= 1
+            return text[1:-1], parsed_entities
+
+        prefix, prefix_entities = parse_affix(prefix_html)
+        suffix, suffix_entities = parse_affix(suffix_html)
+        prefix_length = len(prefix.encode("utf-16-le")) // 2
+        body_length = len(raw.encode("utf-16-le")) // 2
+        for entity in entities:
+            entity.offset += prefix_length
+        for entity in suffix_entities:
+            entity.offset += prefix_length + body_length
+        return prefix + raw + suffix, prefix_entities + entities + suffix_entities
+
     async def _save_self_destructive(
         self, user: User, message: Message, channel, cache: dict, downloaded_media=None
     ):
@@ -824,27 +848,35 @@ class LebedKAPMLogMod(loader.Module):
                     or f"ttl_{ttl}{ext}"
                 )
                 file.seek(0)
-                caption = header + utils.escape_html(message.text or "")
+                caption, entities = self._message_payload(message, header)
                 msg = await self._client.send_file(
                     channel.id,
                     file,
                     force_document=True,
                     caption=caption,
+                    parse_mode=None,
+                    formatting_entities=entities,
                     reply_to=topic_id,
                 )
             except Exception as e:
                 logger.exception("Failed to download self-destructive media: %s", e)
-                text = utils.escape_html(message.text or message.raw_text or "")
+                text, entities = self._message_payload(
+                    message, header, "\n\n<i>Failed to download media</i>"
+                )
                 msg = await self._client.send_message(
                     channel.id,
-                    header + text + "\n\n<i>⚠️ Failed to download media</i>",
+                    text,
+                    parse_mode=None,
+                    formatting_entities=entities,
                     reply_to=topic_id,
                 )
         else:
-            text = utils.escape_html(message.text or message.raw_text or "")
+            text, entities = self._message_payload(message, header)
             msg = await self._client.send_message(
                 channel.id,
-                header + text,
+                text,
+                parse_mode=None,
+                formatting_entities=entities,
                 reply_to=topic_id,
             )
 
@@ -871,18 +903,22 @@ class LebedKAPMLogMod(loader.Module):
                 (message.file.name if message.file else None) or f"media{ext}"
             )
             file.seek(0)
-            caption = utils.escape_html(message.text or "")
+            caption, entities = self._message_payload(message)
             msg = await self._client.send_file(
                 channel.id,
                 file,
                 caption=caption,
+                parse_mode=None,
+                formatting_entities=entities,
                 reply_to=topic_id,
             )
         else:
-            text = utils.escape_html(message.text or message.raw_text or "")
+            text, entities = self._message_payload(message)
             msg = await self._client.send_message(
                 channel.id,
                 text,
+                parse_mode=None,
+                formatting_entities=entities,
                 reply_to=topic_id,
             )
         await self._mark_topic_read(msg, channel)
