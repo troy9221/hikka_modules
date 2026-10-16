@@ -1,4 +1,4 @@
-__version__ = (1, 3, 0, 0)
+__version__ = (1, 3, 0, 1)
 
 # This file is a part of Hikka Userbot!
 # This product includes software developed by t.me/Fl1yd and t.me/spypm.
@@ -12,6 +12,7 @@ __version__ = (1, 3, 0, 0)
 # thx to t.me/LyoSU for github.com/LyoSU/quote-api
 
 # meta developer: @yg_modules
+# requires: Pillow requests
 # scope: hikka_only
 # scope: hikka_min 1.6.3
 
@@ -26,13 +27,14 @@ __version__ = (1, 3, 0, 0)
 # █▄█ █░█ █▀▄▀█ █▀▄▀█ █▄█   █▀▄▀█ █▀█ █▀▄ █▀
 # ░█░ █▄█ █░▀░█ █░▀░█ ░█░   █░▀░█ █▄█ █▄▀ ▄█
 
-import base64, io, requests, telethon
+import base64, io, requests
+import hikkatl as telethon
 from time import gmtime
 from typing import List, Optional, Tuple, Union
 from PIL import Image, ImageDraw
-from telethon.tl import types
-from telethon.extensions import html
-from telethon.tl.patched import Message
+from hikkatl.tl import types
+from hikkatl.extensions import html
+from hikkatl.tl.patched import Message
 
 from .. import loader, utils
 
