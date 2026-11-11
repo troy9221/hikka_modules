@@ -16,7 +16,7 @@ import aiohttp
 
 from .. import loader, utils
 
-__version__ = (1, 2, 0)
+__version__ = (1, 2, 1)
 
 logger = logging.getLogger(__name__)
 API_URL = "https://api.openai.com/v1/responses"
@@ -116,9 +116,12 @@ class FirstContactAIMod(loader.Module):
         return process.returncode, (stdout + b"\n" + stderr).decode("utf-8", errors="replace")
 
     async def _generate_codex(self, messages, instructions):
-        executable = shutil.which(os.environ.get("FIRSTCONTACT_CODEX_BIN", "codex"))
+        configured_bin = os.environ.get("FIRSTCONTACT_CODEX_BIN", "").strip()
+        executable = shutil.which(configured_bin or "codex")
+        if not executable and not configured_bin:
+            executable = shutil.which(str(Path.home() / ".local" / "bin" / "codex"))
         if not executable:
-            raise OpenAIError("Codex CLI не найден. Проверьте PATH процесса Hikka или FIRSTCONTACT_CODEX_BIN.")
+            raise OpenAIError("Codex CLI не найден в PATH или ~/.local/bin пользователя Hikka. Проверьте установку или FIRSTCONTACT_CODEX_BIN.")
 
         env = {key: os.environ[key] for key in CODEX_ENV_KEYS if key in os.environ}
         async with self._codex_slot:
