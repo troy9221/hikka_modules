@@ -11,16 +11,18 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
+from html import escape
 from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 4, 1)
+__version__ = (1, 5, 0)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
 STALL_ROUNDS = 4
 GUESS_ROLES = ("bridge", "neighbor", "alternative")
+GROUP_PERMISSIONS = {"allow": "разрешено", "deny": "запрещено"}
 REPLY_STYLE_TAGS = {"italic": "i", "bold": "b", "plain": None}
 CODEX_MODELS_HELP = (
     "auto — модель по умолчанию Codex CLI.\n"
@@ -133,6 +135,19 @@ def chat_key(message):
     return f"{message.chat_id}:{topic}"
 
 
+def validate_group_rule(value):
+    if value == "":
+        return ""
+    parts = [part.strip() for part in str(value).split("|", 2)]
+    if len(parts) == 3:
+        group_id, permission, title = parts
+        permission = permission.lower()
+        title = " ".join(title.split())
+        if re.fullmatch(r"-[1-9][0-9]*", group_id) and permission in GROUP_PERMISSIONS and title:
+            return f"{group_id} | {permission} | {title}"
+    raise loader.validators.ValidationError("Введите отрицательный ID | allow или deny | Название группы.")
+
+
 @dataclass
 class Round:
     latest_id: int = 0
@@ -155,6 +170,7 @@ class ContextnoCodexMod(loader.Module):
     strings = {"name": "ContextnoCodex"}
 
     def __init__(self):
+        self._rounds = {}
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
                 "codex_bin", "", "Путь к Codex CLI. По умолчанию используется FIRSTCONTACT_CODEX_BIN, PATH или ~/.local/bin.",
@@ -175,8 +191,17 @@ class ContextnoCodexMod(loader.Module):
                 "Например, при 500 модуль вступает в игру с места 500 или ближе.",
                 validator=loader.validators.Integer(minimum=2),
             ),
+            loader.ConfigValue(
+                "group_rules", [],
+                "Правила для всех тем группы. Добавляйте по одному в формате "
+                "ID | allow или deny | Название группы. Например, -1001234567890 | allow | Контекстно с друзьями. "
+                "Для одного ID действует последнее правило. Команда .contextno group показывает ID текущей группы.",
+                validator=loader.validators.Series(
+                    loader.validators.Validator(validate_group_rule, "строкой ID | allow или deny | Название группы"),
+                ),
+                on_change=self._prune_disabled_rounds,
+            ),
         )
-        self._rounds = {}
         self._codex_lock = asyncio.Lock()
 
     async def client_ready(self):
@@ -194,25 +219,83 @@ class ContextnoCodexMod(loader.Module):
     def _can_play(self, game):
         return not game.closed and 1 < game.best <= self.config["start_rank"]
 
+    def _group_rule(self, group_id):
+        for rule in reversed(self.config["group_rules"]):
+            saved_id, permission, title = rule.split(" | ", 2)
+            if saved_id == group_id:
+                return permission, title
+        return None
+
+    def _is_enabled(self, key):
+        rule = self._group_rule(key.split(":", 1)[0])
+        return rule[0] == "allow" if rule else key in self.get("enabled", [])
+
+    def _prune_disabled_rounds(self):
+        for key in list(self._rounds):
+            if not self._is_enabled(key):
+                game = self._rounds.pop(key)
+                if game.worker:
+                    game.worker.cancel()
+
+    def _set_group_rule(self, group_id, permission, title=""):
+        rules = [rule for rule in self.config["group_rules"] if rule.split(" | ", 1)[0] != group_id]
+        if permission in GROUP_PERMISSIONS:
+            rules.append(f"{group_id} | {permission} | {title}")
+        self.config["group_rules"] = rules
+
+    async def _group_command(self, message, permission):
+        if not message.is_group:
+            return "Выполни .contextno group в группе, чтобы узнать её ID и название."
+        if permission not in {"", "allow", "deny", "clear"}:
+            return "Используй .contextno group allow, deny или clear."
+        group_id = str(message.chat_id)
+        chat = await message.get_chat()
+        title = " ".join((getattr(chat, "title", None) or f"Группа {group_id}").split())
+        label = f"{escape(title)} (<code>{group_id}</code>)"
+        if permission:
+            self._set_group_rule(group_id, permission, title)
+            if permission == "clear":
+                return f"{label}. Правило удалено. Действуют настройки чата или темы."
+            return f"{label}. Во всех темах {GROUP_PERMISSIONS[permission]}."
+        rule = self._group_rule(group_id)
+        policy = f"Во всех темах {GROUP_PERMISSIONS[rule[0]]}." if rule else "Правила для группы пока нет."
+        return f"{label}. {policy}"
+
     @loader.command()
     async def contextno(self, message):
-        """<on|off|status|check|models> — управление автоподбором и справка по моделям."""
+        """<on|off|status|check|models|groups|group> — управление автоподбором и правилами групп."""
         action = utils.get_args_raw(message).strip().lower() or "status"
         key = chat_key(message)
-        enabled = set(self.get("enabled", []))
+        group_id = key.split(":", 1)[0]
         if action in {"on", "off"}:
-            if action == "on":
-                enabled.add(key)
+            rule = self._group_rule(group_id)
+            if rule:
+                permission = "allow" if action == "on" else "deny"
+                self._set_group_rule(group_id, permission, rule[1])
+                result = f"{escape(rule[1])}. Во всех темах {GROUP_PERMISSIONS[permission]}."
             else:
-                enabled.discard(key)
-                game = self._rounds.pop(key, None)
-                if game and game.worker:
-                    game.worker.cancel()
-            self.set("enabled", sorted(enabled))
-            result = "Автоподбор включён." if action == "on" else "Автоподбор выключен."
+                enabled = set(self.get("enabled", []))
+                if action == "on":
+                    enabled.add(key)
+                else:
+                    enabled.discard(key)
+                self.set("enabled", sorted(enabled))
+                self._prune_disabled_rounds()
+                result = "Автоподбор включён." if action == "on" else "Автоподбор выключен."
+        elif action == "groups":
+            rules = {}
+            for rule in self.config["group_rules"]:
+                saved_id, permission, title = rule.split(" | ", 2)
+                rules[saved_id] = f"{escape(title)} (<code>{saved_id}</code>) — {GROUP_PERMISSIONS[permission]}"
+            result = "\n".join(rules.values()) or "Правил пока нет. Открой .config ContextnoCodex → group_rules."
+        elif action == "group" or action.startswith("group "):
+            result = await self._group_command(message, action[5:].strip())
         elif action == "status":
             game = self._rounds.get(key)
-            result = "Автоподбор включён." if key in enabled else "Автоподбор выключен."
+            result = "Автоподбор включён." if self._is_enabled(key) else "Автоподбор выключен."
+            rule = self._group_rule(group_id)
+            if rule:
+                result += f" {escape(rule[1])} (<code>{group_id}</code>) — {GROUP_PERMISSIONS[rule[0]]}."
             result += f" Порог входа: топ-{self.config['start_rank']}."
             if game and game.best:
                 result += f" Лучшее место в топе: {game.best}. Попыток: {len(game.guesses)}."
@@ -240,18 +323,18 @@ class ContextnoCodexMod(loader.Module):
             except CodexError as exc:
                 result = str(exc)
         else:
-            result = "Используйте .contextno on, off, status, check или models."
+            result = "Используйте .contextno on, off, status, check, models, groups или group."
         await utils.answer(message, result)
 
     @loader.watcher("in", "only_messages")
     async def watcher(self, message):
         key = chat_key(message)
-        if key not in self.get("enabled", []):
+        if not self._is_enabled(key):
             return
         sender = getattr(message, "sender", None) or await message.get_sender()
         if not getattr(sender, "bot", False) or (getattr(sender, "username", None) or "").lower() != BOT:
             return
-        if key not in self.get("enabled", []):
+        if not self._is_enabled(key):
             return
 
         game = self._rounds.setdefault(key, Round())
@@ -373,10 +456,10 @@ class ContextnoCodexMod(loader.Module):
         retried = False
         game.last_error = ""
         try:
-            while self._can_play(game):
+            while self._is_enabled(key) and self._can_play(game):
                 data, effort = self._guess_context(game, retried)
                 candidates = await self._suggest(data, effort)
-                if self._rounds.get(key) is not game or not self._can_play(game):
+                if self._rounds.get(key) is not game or not self._is_enabled(key) or not self._can_play(game):
                     return
                 excluded = game.guesses.keys() | game.unknown | game.scores.keys()
                 role_order = data["приоритет_ролей"]
