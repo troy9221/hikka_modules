@@ -17,7 +17,7 @@ import aiohttp
 
 from .. import loader, utils
 
-__version__ = (1, 3, 0)
+__version__ = (1, 3, 1)
 
 logger = logging.getLogger(__name__)
 API_URL = "https://api.openai.com/v1/responses"
@@ -226,7 +226,7 @@ class FirstContactAIMod(loader.Module):
             self.set("enabled", action == "on")
             await utils.answer(message, "Автоответчик включён." if action == "on" else "Автоответчик выключен.")
         elif action == "stop" and message.is_private and message.chat_id != self.tg_id:
-            self._save_chat(message.chat_id, {"stopped": True})
+            self._save_chat(message.chat_id, {"stopped": True, "seen": message.id})
             await utils.answer(message, "Автоответы в этом чате остановлены.")
         elif action == "check":
             if backend == "api" and not key:
@@ -246,32 +246,36 @@ class FirstContactAIMod(loader.Module):
         last_reply = state["last_reply"]
         newer = [item for item in history if item.id > last_reply]
         if any(item.out for item in newer) or len(newer) == HISTORY_LIMIT:
-            self._save_chat(chat_id, {"stopped": True})
+            self._save_chat(chat_id, {"stopped": True, "seen": newer[0].id})
             return False
         return True
 
     async def _reply(self, message, key, generation):
         chat_id = message.chat_id
         state = self._chat(chat_id)
-        if not self._enabled(generation) or (
-            state and (state.get("stopped") or message.id <= state["seen"])
-        ):
-            return
-        if state and state["count"] >= self.config["max_replies"]:
+        previous = state or {}
+        if not self._enabled(generation) or message.id <= previous.get("seen", 0):
             return
 
         peer = await message.get_input_chat()
         history = await self._client.get_messages(peer, limit=HISTORY_LIMIT)
         if not self._enabled(generation) or self._chat(chat_id) != state:
             return
-        if state is None:
-            if not any(item.id == message.id for item in history):
-                return
-            if any(item.id < message.id for item in history):
-                return
-            state = {"first": message.id, "seen": 0, "last_reply": 0, "count": 0}
+        if not history:
+            return
+        oldest = history[-1].id
+        last_known = max(previous.get(name, 0) for name in ("first", "seen", "last_reply"))
+        if last_known:
+            new_history = len(history) < HISTORY_LIMIT and oldest > last_known
+        else:
+            # Also handles stopped states saved by earlier versions without message IDs.
+            new_history = oldest == message.id
+        if new_history:
+            state = {"first": oldest, "seen": 0, "last_reply": 0, "count": 0}
             self._save_chat(chat_id, state)
 
+        if not state or state.get("stopped") or state["count"] >= self.config["max_replies"]:
+            return
         if not self._can_continue(chat_id, state, history):
             return
         context = []
@@ -291,6 +295,8 @@ class FirstContactAIMod(loader.Module):
         if not self._enabled(generation) or self._chat(chat_id) != state:
             return
         if not self._can_continue(chat_id, state, latest):
+            return
+        if not any(item.id == pending[-1] for item in latest):
             return
 
         text = f"<i>{escape(answer)}</i>"
