@@ -15,10 +15,9 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 3, 1)
+__version__ = (1, 3, 2)
 
 BOT = "contextno_rf_bot"
-TOP_LIMIT = 500
 CODEX_TIMEOUT = 30
 REPLY_STYLE_TAGS = {"italic": "i", "bold": "b", "plain": None}
 CODEX_MODELS_HELP = (
@@ -126,7 +125,7 @@ class Round:
 
 @loader.tds
 class ContextnoCodexMod(loader.Module):
-    """Играет в Контекстно через Codex CLI после входа в топ-500."""
+    """Играет в Контекстно через Codex CLI при достижении заданной близости."""
 
     strings = {"name": "ContextnoCodex"}
 
@@ -145,6 +144,12 @@ class ContextnoCodexMod(loader.Module):
                 "Стиль догадок в Telegram. italic — курсив, bold — жирный, plain — обычный текст.",
                 validator=loader.validators.Choice(list(REPLY_STYLE_TAGS)),
             ),
+            loader.ConfigValue(
+                "start_rank", 500,
+                "Максимальное место в «Топе ближайших слов», при котором модуль начинает играть. "
+                "Например, при 500 модуль вступает в игру с места 500 или ближе.",
+                validator=loader.validators.Integer(minimum=2),
+            ),
         )
         self._rounds = {}
         self._codex_lock = asyncio.Lock()
@@ -160,6 +165,9 @@ class ContextnoCodexMod(loader.Module):
             if game.worker:
                 game.worker.cancel()
         self._rounds.clear()
+
+    def _can_play(self, game):
+        return not game.closed and 1 < game.best <= self.config["start_rank"]
 
     @loader.command()
     async def contextno(self, message):
@@ -180,6 +188,7 @@ class ContextnoCodexMod(loader.Module):
         elif action == "status":
             game = self._rounds.get(key)
             result = "Автоподбор включён." if key in enabled else "Автоподбор выключен."
+            result += f" Порог входа: топ-{self.config['start_rank']}."
             if game and game.best:
                 result += f" Лучшее место в топе: {game.best}. Попыток: {len(game.guesses)}."
                 if game.last_guess_score:
@@ -277,7 +286,7 @@ class ContextnoCodexMod(loader.Module):
             feedback = True
         game.latest_id = message.id
         if (
-            1 < game.best <= TOP_LIMIT
+            self._can_play(game)
             and (top or feedback)
             and not game.worker
         ):
@@ -287,7 +296,7 @@ class ContextnoCodexMod(loader.Module):
         retried = False
         game.last_error = ""
         try:
-            while 1 < game.best <= TOP_LIMIT:
+            while self._can_play(game):
                 ranked = sorted(game.scores.values(), key=lambda item: item[1])
                 recent = list(game.scores.values())[-20:]
                 data = {
@@ -299,7 +308,7 @@ class ContextnoCodexMod(loader.Module):
                 if retried:
                     data["повторный_подбор"] = "В предыдущем ответе не было новых слов. Предложи другие смысловые связи."
                 words = await self._suggest(data)
-                if self._rounds.get(key) is not game or game.closed or not 1 < game.best <= TOP_LIMIT:
+                if self._rounds.get(key) is not game or not self._can_play(game):
                     return
                 excluded = game.guesses | game.unknown | game.scores.keys()
                 guess = next((word for word in words if normalize(word) not in excluded), "")
