@@ -15,11 +15,10 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 2, 0)
+__version__ = (1, 3, 0)
 
 BOT = "contextno_rf_bot"
 TOP_LIMIT = 500
-ROUND_ATTEMPTS = 12
 CODEX_TIMEOUT = 30
 CODEX_MODELS_HELP = (
     "auto — модель по умолчанию Codex CLI.\n"
@@ -60,10 +59,13 @@ OUTPUT_SCHEMA = {
 PROMPT = (
     "Игра Контекстно: нужно угадать скрытое русское слово по семантическим рангам "
     "проверенных слов. Ранг 1 — разгадка, меньший ранг означает более близкий "
-    "контекст употребления. Найди общую тему ближайших слов с учётом далёких попыток. "
+    "контекст употребления. Опирайся прежде всего на слова с наименьшими рангами. "
+    "Сравни ранг последней догадки с лучшими рангами: если ранг заметно хуже, "
+    "проверь другую смысловую связь ближайших слов. Если ранг лучше, развивай эту тему. "
+    "Используй далёкие слова как отрицательные подсказки. "
     "Верни 3 новых варианта по убыванию вероятности в массиве words. "
     "Каждый вариант — одно слово кириллицей, строчными буквами, в начальной форме. "
-    "Исключи проверенные, отправленные и неизвестные словарю слова."
+    "Не предлагай ни одного слова из списка исключений."
 )
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,8 @@ class Round:
     scores: dict = field(default_factory=dict)
     unknown: set = field(default_factory=set)
     guesses: set = field(default_factory=set)
+    last_guess_score: tuple | None = None
+    last_error: str = ""
     pending: str = ""
     closed: bool = False
     worker: object = None
@@ -171,7 +175,14 @@ class ContextnoCodexMod(loader.Module):
             game = self._rounds.get(key)
             result = "Автоподбор включён." if key in enabled else "Автоподбор выключен."
             if game and game.best:
-                result += f" Лучшее место: {game.best}. Попыток: {len(game.guesses)}/{ROUND_ATTEMPTS}."
+                result += f" Лучшее место в топе: {game.best}. Попыток: {len(game.guesses)}."
+                if game.last_guess_score:
+                    word, rank = game.last_guess_score
+                    result += f" Последняя оценённая догадка: {word} ({rank})."
+                if game.closed:
+                    result += " Раунд завершён."
+                if game.last_error:
+                    result += f" Последняя ошибка: {game.last_error}"
         elif action == "models":
             result = f"Выбор модели в .config ContextnoCodex → codex_model.\n\n{CODEX_MODELS_HELP}"
         elif action == "check":
@@ -223,7 +234,10 @@ class ContextnoCodexMod(loader.Module):
         if game.closed:
             return
 
-        ranks = top + ([ranked_word(score)] if score else [])
+        latest_score = ranked_word(score) if score else None
+        ranks = top + ([latest_score] if latest_score else [])
+        if latest_score and normalize(latest_score[0]) in game.guesses:
+            game.last_guess_score = latest_score
         if finished or any(rank == 1 for _, rank in ranks):
             game.latest_id = message.id
             game.closed = True
@@ -231,12 +245,14 @@ class ContextnoCodexMod(loader.Module):
                 game.worker.cancel()
             return
 
+        feedback = False
         if unknown:
             word = normalize(unknown.group(1))
             game.unknown.add(word)
             if word != game.pending:
                 return
             game.pending = ""
+            feedback = True
         elif top:
             game.best = min(rank for _, rank in top)
         elif not score:
@@ -244,51 +260,67 @@ class ContextnoCodexMod(loader.Module):
 
         for word, rank in top:
             game.scores[normalize(word)] = (word, rank)
-        if score:
-            word, rank = ranked_word(score)
+        if latest_score:
+            word, rank = latest_score
             normalized = normalize(word)
             game.scores.pop(normalized, None)
             game.scores[normalized] = (word, rank)
-            if normalized == game.pending:
-                game.pending = ""
+        if game.pending and game.pending in game.scores:
+            game.last_guess_score = game.scores[game.pending]
+            game.pending = ""
+            feedback = True
         game.latest_id = message.id
         if (
             1 < game.best <= TOP_LIMIT
-            and len(game.guesses) < ROUND_ATTEMPTS
-            and (top or unknown)
+            and (top or feedback)
             and not game.worker
         ):
             game.worker = asyncio.create_task(self._play(key, game))
 
     async def _play(self, key, game):
+        retried = False
+        game.last_error = ""
         try:
-            while 1 < game.best <= TOP_LIMIT and len(game.guesses) < ROUND_ATTEMPTS:
-                revision = game.latest_id
+            while 1 < game.best <= TOP_LIMIT:
                 ranked = sorted(game.scores.values(), key=lambda item: item[1])
                 recent = list(game.scores.values())[-20:]
-                words = await self._suggest({
+                data = {
                     "ближайшие": ranked[:24],
-                    "последние": recent,
-                    "уже_отправлены": sorted(game.guesses),
-                    "нет_в_словаре": sorted(game.unknown)[-40:],
-                })
+                    "последние_оценённые_слова": recent,
+                    "последняя_оценённая_догадка_модуля": game.last_guess_score,
+                    "исключить": sorted(game.guesses | game.unknown | game.scores.keys()),
+                }
+                if retried:
+                    data["повторный_подбор"] = "В предыдущем ответе не было новых слов. Предложи другие смысловые связи."
+                words = await self._suggest(data)
                 if self._rounds.get(key) is not game or game.closed or not 1 < game.best <= TOP_LIMIT:
                     return
                 excluded = game.guesses | game.unknown | game.scores.keys()
                 guess = next((word for word in words if normalize(word) not in excluded), "")
                 if not guess:
-                    if revision != game.latest_id:
+                    if not retried:
+                        retried = True
                         continue
+                    game.last_error = "Codex дважды не предложил нового слова."
                     return
-                game.pending = normalize(guess)
-                game.guesses.add(game.pending)
+                retried = False
+                normalized = normalize(guess)
+                game.pending = normalized
+                game.guesses.add(normalized)
                 revision = game.latest_id
-                await game.latest_bot_message.reply(guess, parse_mode=None)
+                try:
+                    await game.latest_bot_message.reply(guess, parse_mode=None)
+                except Exception:
+                    game.guesses.discard(normalized)
+                    game.pending = ""
+                    raise
                 if revision == game.latest_id or game.pending:
                     return
         except CodexError as exc:
+            game.last_error = str(exc)
             logger.warning("ContextnoCodex: %s", exc)
         except Exception:
+            game.last_error = "Hikka не смогла отправить догадку в Telegram."
             logger.exception("ContextnoCodex: ошибка при отправке слова")
         finally:
             game.worker = None
