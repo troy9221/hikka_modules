@@ -11,6 +11,7 @@
 | [**YG Quotes**](README_MODULES/README_fq.md) | Создание красивых цитат из сообщений — реальных и фейковых | `.dlmod https://raw.githubusercontent.com/troy9221/hikka_modules/main/fq.py` |
 | [**Just Leave**](README_MODULES/README_leave.md) | Быстрый выход из группы/канала с прощальным сообщением | `.dlmod https://raw.githubusercontent.com/troy9221/hikka_modules/main/leave.py` |
 | [**Sing**](README_MODULES/README_sing.md) | Песни текстом — одна сменяющаяся строка | `.dlmod https://raw.githubusercontent.com/troy9221/hikka_modules/main/sing.py` |
+| [**FirstContactAI**](README_MODULES/README_first_contact_ai.md) | ИИ-автоответчик для новых личных чатов | `.dlmod https://raw.githubusercontent.com/troy9221/hikka_modules/main/first_contact_ai.py` |
 
 ## Установка
 
