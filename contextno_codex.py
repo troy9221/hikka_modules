@@ -15,10 +15,11 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 3, 2)
+__version__ = (1, 4, 0)
 
 BOT = "contextno_rf_bot"
-CODEX_TIMEOUT = 30
+CODEX_TIMEOUTS = {"low": 30, "medium": 55}
+STALL_ROUNDS = 4
 REPLY_STYLE_TAGS = {"italic": "i", "bold": "b", "plain": None}
 CODEX_MODELS_HELP = (
     "auto — модель по умолчанию Codex CLI.\n"
@@ -52,20 +53,32 @@ ENV_KEYS = (
 )
 OUTPUT_SCHEMA = {
     "type": "object",
-    "properties": {"words": {"type": "array", "items": {"type": "string"}}},
-    "required": ["words"],
+    "properties": {
+        "candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"word": {"type": "string"}, "theme": {"type": "string"}},
+                "required": ["word", "theme"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["candidates"],
     "additionalProperties": False,
 }
 PROMPT = (
     "Игра Контекстно: нужно угадать скрытое русское слово по семантическим рангам "
     "проверенных слов. Ранг 1 — разгадка, меньший ранг означает более близкий "
-    "контекст употребления. Опирайся прежде всего на слова с наименьшими рангами. "
-    "Сравни ранг последней догадки с лучшими рангами: если ранг заметно хуже, "
-    "проверь другую смысловую связь ближайших слов. Если ранг лучше, развивай эту тему. "
-    "Используй далёкие слова как отрицательные подсказки. "
-    "Верни 3 новых варианта по убыванию вероятности в массиве words. "
-    "Каждый вариант — одно слово кириллицей, строчными буквами, в начальной форме. "
-    "Не предлагай ни одного слова из списка исключений."
+    "контекст употребления. Сопоставь несколько лучших слов и их разные значения. "
+    "Ищи общее окружение слов: типичные сочетания, предмет, действие, профессию "
+    "или область, где они встречаются вместе. Сравни ранги прошлых догадок с лучшим "
+    "рангом на момент отправки. Развивай связи, которые дали улучшение. "
+    "Далёкие ответы ослабляют соответствующую гипотезу, но не исключают её полностью. "
+    "Следуй стратегии текущего хода. Верни 3 разных варианта в порядке предпочтения. "
+    "word — одно слово кириллицей, строчными буквами, в начальной форме. "
+    "theme — название проверяемой смысловой связи в 2–5 словах. "
+    "Исключи уже проверенные слова и их грамматические формы."
 )
 logger = logging.getLogger(__name__)
 
@@ -115,7 +128,7 @@ class Round:
     best: int = 0
     scores: dict = field(default_factory=dict)
     unknown: set = field(default_factory=set)
-    guesses: set = field(default_factory=set)
+    guesses: dict = field(default_factory=dict)
     last_guess_score: tuple | None = None
     last_error: str = ""
     pending: str = ""
@@ -205,8 +218,8 @@ class ContextnoCodexMod(loader.Module):
             try:
                 loop = asyncio.get_running_loop()
                 started = loop.time()
-                words = await self._suggest({"ближайшие": [["орден", 450], ["медаль", 2200]]})
-                word = next((w for w in words if normalize(w) not in {"орден", "медаль"}), "")
+                candidates = await self._suggest({"ближайшие": [["орден", 450], ["медаль", 2200]]})
+                word = next((w for w, _ in candidates if normalize(w) not in {"орден", "медаль"}), "")
                 elapsed = loop.time() - started
                 result = (
                     f"Codex CLI ответил за {elapsed:.1f} с. Пример слова: {word}."
@@ -292,43 +305,80 @@ class ContextnoCodexMod(loader.Module):
         ):
             game.worker = asyncio.create_task(self._play(key, game))
 
+    def _guess_context(self, game, retried):
+        ranked = sorted(game.scores.values(), key=lambda item: item[1])
+        history = []
+        stalled = 0
+        for word, (theme, best_before) in game.guesses.items():
+            score = game.scores.get(word)
+            if score:
+                _, rank = score
+                stalled = 0 if rank < best_before else stalled + 1
+                history.append({"слово": word, "связь": theme, "ранг": rank, "лучший_до": best_before})
+            elif word in game.unknown:
+                history.append({"слово": word, "связь": theme, "результат": "нет в словаре"})
+
+        best = ranked[0][1]
+        if best <= 10:
+            strategy = (
+                "Проверь ближайших соседей лидеров: точные синонимы, родовое или видовое слово "
+                "и характерные сочетания. Если прежние варианты не приблизили ответ, "
+                "проверь другое значение лидера или соседнюю часть речи."
+            )
+        elif retried or stalled >= STALL_ROUNDS:
+            strategy = (
+                "Проверь альтернативное значение ближайших слов. "
+                "Начни с новой смысловой связи, а остальные варианты возьми из других направлений."
+            )
+        else:
+            strategy = (
+                "Начни со слова, которое объясняет несколько самых близких подсказок. "
+                "Если они неоднозначны, предложи запасные слова из других смысловых направлений."
+            )
+        data = {
+            "ближайшие": ranked[:24],
+            "последние_оценённые_слова": list(game.scores.values())[-20:],
+            "история_догадок_модуля": history[-12:],
+            "попыток_без_улучшения": stalled,
+            "стратегия": strategy,
+            "исключить": sorted(game.guesses.keys() | game.unknown | game.scores.keys()),
+        }
+        if retried:
+            data["повторный_подбор"] = "Предыдущий ответ не содержал новых слов."
+        recheck = stalled > 0 and stalled % STALL_ROUNDS == 0
+        effort = "medium" if retried or best <= 10 or recheck else "low"
+        return data, effort
+
     async def _play(self, key, game):
         retried = False
         game.last_error = ""
         try:
             while self._can_play(game):
-                ranked = sorted(game.scores.values(), key=lambda item: item[1])
-                recent = list(game.scores.values())[-20:]
-                data = {
-                    "ближайшие": ranked[:24],
-                    "последние_оценённые_слова": recent,
-                    "последняя_оценённая_догадка_модуля": game.last_guess_score,
-                    "исключить": sorted(game.guesses | game.unknown | game.scores.keys()),
-                }
-                if retried:
-                    data["повторный_подбор"] = "В предыдущем ответе не было новых слов. Предложи другие смысловые связи."
-                words = await self._suggest(data)
+                data, effort = self._guess_context(game, retried)
+                candidates = await self._suggest(data, effort)
                 if self._rounds.get(key) is not game or not self._can_play(game):
                     return
-                excluded = game.guesses | game.unknown | game.scores.keys()
-                guess = next((word for word in words if normalize(word) not in excluded), "")
-                if not guess:
+                excluded = game.guesses.keys() | game.unknown | game.scores.keys()
+                candidate = next((item for item in candidates if normalize(item[0]) not in excluded), None)
+                if candidate is None:
                     if not retried:
                         retried = True
                         continue
                     game.last_error = "Codex дважды не предложил нового слова."
                     return
                 retried = False
+                guess, theme = candidate
                 normalized = normalize(guess)
                 game.pending = normalized
-                game.guesses.add(normalized)
+                best_before = min(rank for _, rank in game.scores.values())
+                game.guesses[normalized] = (theme, best_before)
                 revision = game.latest_id
                 tag = REPLY_STYLE_TAGS[self.config["reply_style"]]
                 text = f"<{tag}>{guess}</{tag}>" if tag else guess
                 try:
                     await game.latest_bot_message.reply(text, parse_mode="html" if tag else None)
                 except Exception:
-                    game.guesses.discard(normalized)
+                    game.guesses.pop(normalized, None)
                     game.pending = ""
                     raise
                 if revision == game.latest_id or game.pending:
@@ -342,7 +392,7 @@ class ContextnoCodexMod(loader.Module):
         finally:
             game.worker = None
 
-    async def _suggest(self, data):
+    async def _suggest(self, data, effort="low"):
         configured = self.config["codex_bin"].strip() or os.environ.get("FIRSTCONTACT_CODEX_BIN", "").strip()
         executable = shutil.which(configured or "codex")
         if not executable and not configured:
@@ -351,6 +401,7 @@ class ContextnoCodexMod(loader.Module):
             raise CodexError("Codex CLI не найден. Укажите codex_bin в .config ContextnoCodex.")
         model = self.config["codex_model"].strip()
         model_args = ["-m", model] if model and model != "auto" else []
+        timeout = CODEX_TIMEOUTS[effort]
         env = {key: os.environ[key] for key in ENV_KEYS if key in os.environ}
         prompt = f"{PROMPT}\n\n{json.dumps(data, ensure_ascii=False)}".encode("utf-8")
         async with self._codex_lock:
@@ -361,7 +412,7 @@ class ContextnoCodexMod(loader.Module):
                 try:
                     process = await asyncio.create_subprocess_exec(
                         executable, "-a", "never", *model_args,
-                        "-c", 'model_reasoning_effort="low"', "--disable", "shell_tool",
+                        "-c", f'model_reasoning_effort="{effort}"', "--disable", "shell_tool",
                         "--disable", "apps", "--disable", "plugins",
                         "-c", 'web_search="disabled"', "-c", "agents.enabled=false",
                         "-c", "mcp_servers={}", "exec", "--ignore-user-config",
@@ -373,7 +424,7 @@ class ContextnoCodexMod(loader.Module):
                 except OSError as exc:
                     raise CodexError("Hikka не смогла запустить Codex CLI.") from exc
                 try:
-                    _, stderr = await asyncio.wait_for(process.communicate(prompt), CODEX_TIMEOUT)
+                    _, stderr = await asyncio.wait_for(process.communicate(prompt), timeout)
                 except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
                     if process.returncode is None:
                         try:
@@ -383,7 +434,7 @@ class ContextnoCodexMod(loader.Module):
                     await process.wait()
                     if isinstance(exc, asyncio.CancelledError):
                         raise
-                    raise CodexError(f"Codex CLI не ответил за {CODEX_TIMEOUT} секунд.") from exc
+                    raise CodexError(f"Codex CLI не ответил за {timeout} секунд.") from exc
                 if process.returncode:
                     detail = stderr.decode("utf-8", errors="replace").lower()
                     if any(term in detail for term in (
@@ -407,13 +458,17 @@ class ContextnoCodexMod(loader.Module):
                         "Попробуйте codex_model = auto и повторите .contextno check."
                     )
                 try:
-                    words = json.loads(output.read_text(encoding="utf-8"))["words"]
+                    candidates = json.loads(output.read_text(encoding="utf-8"))["candidates"]
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     raise CodexError("Codex CLI вернул некорректный ответ.") from exc
-        if not isinstance(words, list):
+        if not isinstance(candidates, list):
             raise CodexError("Codex CLI вернул некорректный список слов.")
-        return [
-            word for word in words
-            if isinstance(word, str) and len(word) <= 40 and WORD_RE.fullmatch(word)
-        ]
+        suggestions = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            word, theme = candidate.get("word"), candidate.get("theme")
+            if isinstance(word, str) and len(word) <= 40 and WORD_RE.fullmatch(word) and isinstance(theme, str):
+                suggestions.append((word, theme.strip()[:80]))
+        return suggestions
 
