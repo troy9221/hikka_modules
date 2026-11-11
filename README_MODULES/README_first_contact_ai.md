@@ -46,21 +46,21 @@
 1. На сервере Hikka войдите в Linux под пользователем, от которого работает Hikka. Установите актуальный Codex CLI, если его ещё нет.
 
    ```bash
-   npm install -g @openai/codex
-   codex --version
+   npm install --global --prefix "$HOME/.local" @openai/codex
+   "$HOME/.local/bin/codex" --version
    ```
 
 2. Включите вход по коду устройства в настройках безопасности своего аккаунта ChatGPT. Затем запустите на сервере:
 
    ```bash
-   codex login --device-auth
+   "$HOME/.local/bin/codex" login --device-auth
    ```
 
-   Откройте ссылку из терминала, войдите в свой аккаунт ChatGPT и подтвердите код. После входа `codex login status` должен показывать `Logged in using ChatGPT`. [Документация Codex об авторизации](https://learn.chatgpt.com/docs/auth?surface=cli)
+   Откройте ссылку из терминала, войдите в свой аккаунт ChatGPT и подтвердите код. После входа `"$HOME/.local/bin/codex" login status` должен показывать `Logged in using ChatGPT`. [Документация Codex об авторизации](https://learn.chatgpt.com/docs/auth?surface=cli)
 
 3. В Telegram откройте `.config FirstContactAI` → `backend` → `codex`. Запустите `.fcreply check`, затем `.fcreply on` после успешного теста. В этом режиме используется модель по умолчанию Codex CLI и лимит Codex вашего аккаунта ChatGPT.
 
-Если Hikka запущена как служба, её процесс должен видеть тот же домашний каталог и `CODEX_HOME`, с которыми выполнен `codex login`. Если служба не находит `codex`, узнайте полный путь через `command -v codex`, задайте его в переменной окружения `FIRSTCONTACT_CODEX_BIN` службы и перезапустите её.
+Модуль ищет `codex` в `PATH` службы и в `~/.local/bin` пользователя Hikka. Для нестандартной установки задайте полный путь в `FIRSTCONTACT_CODEX_BIN` и перезапустите службу. Процесс Hikka должен видеть тот же домашний каталог и `CODEX_HOME`, с которыми выполнен `codex login`.
 
 Модуль запускает Codex в отдельной временной папке с отключёнными shell, приложениями, плагинами и веб-поиском. Сеанс запускается с `--ephemeral`. Ключ из настроек Hikka и переменные с API-ключами процессу Codex не передаются.
 
