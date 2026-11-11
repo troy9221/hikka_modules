@@ -34,14 +34,14 @@ npm install --global --prefix "$HOME/.local" @openai/codex &&
 
 Откройте ссылку из терминала, войдите в свой аккаунт ChatGPT и подтвердите код. Проверьте вход командой `"$HOME/.local/bin/codex" login status`. Ожидаемый результат — `Logged in using ChatGPT`. [Документация Codex](https://learn.chatgpt.com/docs/auth?surface=cli)
 
-В Telegram выберите **`.config FirstContactAI` → `backend` → `codex`**. В этом режиме модуль использует модель по умолчанию Codex CLI.
+В Telegram выберите **`.config FirstContactAI` → `backend` → `codex`**. Поле `codex_model` по умолчанию равно `auto`, и модель выбирает Codex CLI. Для быстрых ответов попробуйте `gpt-6-luna`, для диалогов с нюансами — `gpt-6.1-terra`. Для сложных диалогов можно выбрать `gpt-6.1-sol`, `gpt-6-sol` или `gpt-6-astra`. Команда `/model` в терминале Codex показывает модели, доступные аккаунту. [Модели Codex](https://learn.chatgpt.com/docs/models?surface=cli)
 
 ## Режим OpenAI API
 
 1. Войдите на [OpenAI Platform](https://platform.openai.com/api-keys), нажмите **Create new secret key**, выберите проект и скопируйте ключ при создании.
 2. Проверьте доступные API-кредиты или оплату в той же организации. [Настройки оплаты OpenAI API](https://platform.openai.com/settings/organization/billing/overview)
 3. В Telegram выберите **`.config FirstContactAI` → `backend` → `api`**, затем сохраните ключ в поле `api_key`. Hikka маскирует его в меню и хранит в своей базе настроек. Если поле пустое, модуль читает `OPENAI_API_KEY` из окружения процесса Hikka.
-4. Поле `model` задаёт модель Responses API. По умолчанию используется `gpt-4.1-mini`.
+4. Поле `model` задаёт модель Responses API. По умолчанию для новых настроек используется `gpt-6-luna`. Также можно выбрать `gpt-6.1-terra`, `gpt-6.1-sol`, `gpt-6-astra` или ввести ID другой модели, доступной вашему API-проекту. Ранее сохранённое значение `gpt-4.1-mini` можно поменять на `gpt-6-luna` до отключения GPT-4.1 mini 14 января 2027 года. [Каталог моделей API](https://developers.openai.com/api/docs/models) · [График отключения моделей](https://developers.openai.com/api/docs/deprecations)
 
 ## Проверка и управление
 
@@ -57,7 +57,8 @@ npm install --global --prefix "$HOME/.local" @openai/codex &&
 
 | Команда | Действие |
 |---|---|
-| `.config FirstContactAI` | Режим подключения, род ответов, ключ, модель API и лимит ответов |
+| `.config FirstContactAI` | Режим подключения, род ответов, ключ, модели Codex и API, лимит ответов |
+| `.fcreply models` | Справка по моделям Codex и API |
 | `.fcreply check` | Тестовый запрос через выбранный режим |
 | `.fcreply on` | Включить автоответчик |
 | `.fcreply status` | Показать состояние и способ подключения |
@@ -74,6 +75,7 @@ npm install --global --prefix "$HOME/.local" @openai/codex &&
 | Codex CLI не найден | Обновите модуль до 1.2.1 или новее. Убедитесь, что `"$HOME/.local/bin/codex" --version` работает под пользователем Hikka |
 | Codex просит войти через ChatGPT | Проверьте `"$HOME/.local/bin/codex" login status` под пользователем Hikka. Если задан `CODEX_HOME`, используйте тот же каталог при входе и при запуске Hikka |
 | Codex сообщил о лимите | Проверьте доступный лимит Codex в настройках аккаунта ChatGPT |
+| Выбранная модель недоступна в Codex | Установите `codex_model = auto` или выберите ID из `/model` |
 | OpenAI HTTP 401 | Проверьте ключ в поле `api_key` |
 | OpenAI HTTP 403 или 404 | Проверьте доступ API-проекта к Responses API и выбранной модели |
 | OpenAI HTTP 429 | Проверьте баланс, квоту и лимиты API-организации. После ошибки модуль откладывает повторные запросы на минуту |
