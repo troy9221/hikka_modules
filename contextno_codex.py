@@ -15,11 +15,12 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 3, 0)
+__version__ = (1, 3, 1)
 
 BOT = "contextno_rf_bot"
 TOP_LIMIT = 500
 CODEX_TIMEOUT = 30
+REPLY_STYLE_TAGS = {"italic": "i", "bold": "b", "plain": None}
 CODEX_MODELS_HELP = (
     "auto — модель по умолчанию Codex CLI.\n"
     "gpt-6-luna — быстрый подбор слов.\n"
@@ -138,6 +139,11 @@ class ContextnoCodexMod(loader.Module):
             loader.ConfigValue(
                 "codex_model", "auto", CODEX_MODELS_HELP,
                 validator=loader.validators.String(min_len=1),
+            ),
+            loader.ConfigValue(
+                "reply_style", "italic",
+                "Стиль догадок в Telegram. italic — курсив, bold — жирный, plain — обычный текст.",
+                validator=loader.validators.Choice(list(REPLY_STYLE_TAGS)),
             ),
         )
         self._rounds = {}
@@ -308,8 +314,10 @@ class ContextnoCodexMod(loader.Module):
                 game.pending = normalized
                 game.guesses.add(normalized)
                 revision = game.latest_id
+                tag = REPLY_STYLE_TAGS[self.config["reply_style"]]
+                text = f"<{tag}>{guess}</{tag}>" if tag else guess
                 try:
-                    await game.latest_bot_message.reply(guess, parse_mode=None)
+                    await game.latest_bot_message.reply(text, parse_mode="html" if tag else None)
                 except Exception:
                     game.guesses.discard(normalized)
                     game.pending = ""
