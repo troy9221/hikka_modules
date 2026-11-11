@@ -15,12 +15,20 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 1, 0)
+__version__ = (1, 2, 0)
 
 BOT = "contextno_rf_bot"
 TOP_LIMIT = 500
 ROUND_ATTEMPTS = 12
 CODEX_TIMEOUT = 30
+CODEX_MODELS_HELP = (
+    "auto — модель по умолчанию Codex CLI.\n"
+    "gpt-6-luna — быстрый подбор слов.\n"
+    "gpt-6.1-terra — быстрый вариант для более сложных подсказок.\n"
+    "gpt-6.1-sol, gpt-6-sol — для сложных раундов.\n"
+    "gpt-6-astra — для самых сложных раундов, если модель доступна.\n"
+    "Можно ввести другой ID. Доступные модели показывает /model в терминале Codex."
+)
 WORD = r"[а-яё]+(?:-[а-яё]+)*"
 NUMBER = r"[0-9]+(?:[ \u00a0\u202f][0-9]{3})*"
 WORD_RE = re.compile(WORD)
@@ -120,16 +128,22 @@ class ContextnoCodexMod(loader.Module):
     def __init__(self):
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
-                "codex_bin", "", "Путь к Codex CLI. Пустое значение — поиск в PATH и ~/.local/bin.",
+                "codex_bin", "", "Путь к Codex CLI. По умолчанию используется FIRSTCONTACT_CODEX_BIN, PATH или ~/.local/bin.",
                 validator=loader.validators.String(),
             ),
             loader.ConfigValue(
-                "codex_model", "gpt-5.4-mini", "Модель Codex для подбора слов.",
+                "codex_model", "auto", CODEX_MODELS_HELP,
                 validator=loader.validators.String(min_len=1),
             ),
         )
         self._rounds = {}
         self._codex_lock = asyncio.Lock()
+
+    async def client_ready(self):
+        if not self.get("codex_model_migrated", False):
+            if self.config["codex_model"] == "gpt-5.4-mini":
+                self.config["codex_model"] = "auto"
+            self.set("codex_model_migrated", True)
 
     async def on_unload(self):
         for game in self._rounds.values():
@@ -139,7 +153,7 @@ class ContextnoCodexMod(loader.Module):
 
     @loader.command()
     async def contextno(self, message):
-        """<on|off|status|check> — управление автоподбором в текущем чате или теме."""
+        """<on|off|status|check|models> — управление автоподбором и справка по моделям."""
         action = utils.get_args_raw(message).strip().lower() or "status"
         key = chat_key(message)
         enabled = set(self.get("enabled", []))
@@ -158,6 +172,8 @@ class ContextnoCodexMod(loader.Module):
             result = "Автоподбор включён." if key in enabled else "Автоподбор выключен."
             if game and game.best:
                 result += f" Лучшее место: {game.best}. Попыток: {len(game.guesses)}/{ROUND_ATTEMPTS}."
+        elif action == "models":
+            result = f"Выбор модели в .config ContextnoCodex → codex_model.\n\n{CODEX_MODELS_HELP}"
         elif action == "check":
             await utils.answer(message, "Проверяю Codex CLI…")
             try:
@@ -173,7 +189,7 @@ class ContextnoCodexMod(loader.Module):
             except CodexError as exc:
                 result = str(exc)
         else:
-            result = "Используйте .contextno on, off, status или check."
+            result = "Используйте .contextno on, off, status, check или models."
         await utils.answer(message, result)
 
     @loader.watcher("in", "only_messages")
@@ -278,12 +294,14 @@ class ContextnoCodexMod(loader.Module):
             game.worker = None
 
     async def _suggest(self, data):
-        configured = self.config["codex_bin"].strip()
+        configured = self.config["codex_bin"].strip() or os.environ.get("FIRSTCONTACT_CODEX_BIN", "").strip()
         executable = shutil.which(configured or "codex")
         if not executable and not configured:
             executable = shutil.which(str(Path.home() / ".local" / "bin" / "codex"))
         if not executable:
             raise CodexError("Codex CLI не найден. Укажите codex_bin в .config ContextnoCodex.")
+        model = self.config["codex_model"].strip()
+        model_args = ["-m", model] if model and model != "auto" else []
         env = {key: os.environ[key] for key in ENV_KEYS if key in os.environ}
         prompt = f"{PROMPT}\n\n{json.dumps(data, ensure_ascii=False)}".encode("utf-8")
         async with self._codex_lock:
@@ -293,7 +311,7 @@ class ContextnoCodexMod(loader.Module):
                 output = Path(cwd) / "answer.json"
                 try:
                     process = await asyncio.create_subprocess_exec(
-                        executable, "-a", "never", "-m", self.config["codex_model"].strip(),
+                        executable, "-a", "never", *model_args,
                         "-c", 'model_reasoning_effort="low"', "--disable", "shell_tool",
                         "--disable", "apps", "--disable", "plugins",
                         "-c", 'web_search="disabled"', "-c", "agents.enabled=false",
@@ -301,12 +319,12 @@ class ContextnoCodexMod(loader.Module):
                         "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only",
                         "--output-schema", str(schema), "--output-last-message", str(output), "-",
                         cwd=cwd, env=env, stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
                     )
                 except OSError as exc:
                     raise CodexError("Hikka не смогла запустить Codex CLI.") from exc
                 try:
-                    await asyncio.wait_for(process.communicate(prompt), CODEX_TIMEOUT)
+                    _, stderr = await asyncio.wait_for(process.communicate(prompt), CODEX_TIMEOUT)
                 except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
                     if process.returncode is None:
                         try:
@@ -318,9 +336,26 @@ class ContextnoCodexMod(loader.Module):
                         raise
                     raise CodexError(f"Codex CLI не ответил за {CODEX_TIMEOUT} секунд.") from exc
                 if process.returncode:
+                    detail = stderr.decode("utf-8", errors="replace").lower()
+                    if any(term in detail for term in (
+                        "model_not_found", "not supported when using codex", "unsupported model",
+                        "model is not available", "model is not supported", "invalid model",
+                    )):
+                        raise CodexError(
+                            "Выбранная модель недоступна в Codex. "
+                            "В .config ContextnoCodex → codex_model выберите auto или модель из /model."
+                        )
+                    if any(term in detail for term in ("usage limit", "rate limit", "429")):
+                        raise CodexError("Codex сообщил о лимите. Проверьте лимит Codex в аккаунте.")
+                    if any(term in detail for term in (
+                        "401 unauthorized", "invalid_grant", "refresh token", "not logged in", "login required",
+                    )):
+                        raise CodexError("Codex сообщил об ошибке входа. Проверьте codex login status под пользователем Hikka.")
+                    if any(term in detail for term in ("unexpected argument", "unrecognized option")):
+                        raise CodexError("Установленная версия Codex CLI не поддерживает один из параметров. Обновите Codex CLI.")
                     raise CodexError(
                         f"Codex CLI завершился с кодом {process.returncode}. "
-                        "Проверьте codex login status под пользователем Hikka."
+                        "Попробуйте codex_model = auto и повторите .contextno check."
                     )
                 try:
                     words = json.loads(output.read_text(encoding="utf-8"))["words"]
