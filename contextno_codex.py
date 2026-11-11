@@ -15,11 +15,12 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 4, 0)
+__version__ = (1, 4, 1)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
 STALL_ROUNDS = 4
+GUESS_ROLES = ("bridge", "neighbor", "alternative")
 REPLY_STYLE_TAGS = {"italic": "i", "bold": "b", "plain": None}
 CODEX_MODELS_HELP = (
     "auto — модель по умолчанию Codex CLI.\n"
@@ -58,8 +59,12 @@ OUTPUT_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {"word": {"type": "string"}, "theme": {"type": "string"}},
-                "required": ["word", "theme"],
+                "properties": {
+                    "word": {"type": "string"},
+                    "theme": {"type": "string"},
+                    "role": {"type": "string", "enum": list(GUESS_ROLES)},
+                },
+                "required": ["word", "theme", "role"],
                 "additionalProperties": False,
             },
         },
@@ -75,7 +80,14 @@ PROMPT = (
     "или область, где они встречаются вместе. Сравни ранги прошлых догадок с лучшим "
     "рангом на момент отправки. Развивай связи, которые дали улучшение. "
     "Далёкие ответы ослабляют соответствующую гипотезу, но не исключают её полностью. "
-    "Следуй стратегии текущего хода. Верни 3 разных варианта в порядке предпочтения. "
+    "Несколько близких однокоренных слов или синонимов считай одной группой подсказок. "
+    "Отдельно ищи близкие слова из другой группы, даже если они стоят немного ниже. "
+    "Верни по одному кандидату на каждую роль. "
+    "bridge — слово, которое естественно сочетается с подсказками из двух групп. "
+    "Проверь, что с каждой группой у него своя естественная связь. "
+    "neighbor — точное соседнее понятие сильнейшей подсказки. "
+    "alternative — другое значение, участник или условие ситуации, которое ещё не проверяли. "
+    "Все три слова должны проверять разные связи. Следуй стратегии текущего хода. "
     "word — одно слово кириллицей, строчными буквами, в начальной форме. "
     "theme — название проверяемой смысловой связи в 2–5 словах. "
     "Исключи уже проверенные слова и их грамматические формы."
@@ -219,7 +231,7 @@ class ContextnoCodexMod(loader.Module):
                 loop = asyncio.get_running_loop()
                 started = loop.time()
                 candidates = await self._suggest({"ближайшие": [["орден", 450], ["медаль", 2200]]})
-                word = next((w for w, _ in candidates if normalize(w) not in {"орден", "медаль"}), "")
+                word = next((w for w, _, _ in candidates if normalize(w) not in {"орден", "медаль"}), "")
                 elapsed = loop.time() - started
                 result = (
                     f"Codex CLI ответил за {elapsed:.1f} с. Пример слова: {word}."
@@ -309,21 +321,28 @@ class ContextnoCodexMod(loader.Module):
         ranked = sorted(game.scores.values(), key=lambda item: item[1])
         history = []
         stalled = 0
-        for word, (theme, best_before) in game.guesses.items():
+        role_misses = dict.fromkeys(GUESS_ROLES, 0)
+        for word, (theme, role, best_before) in game.guesses.items():
+            attempt = {"слово": word, "связь": theme, "роль": role}
             score = game.scores.get(word)
             if score:
                 _, rank = score
-                stalled = 0 if rank < best_before else stalled + 1
-                history.append({"слово": word, "связь": theme, "ранг": rank, "лучший_до": best_before})
+                if rank < best_before:
+                    stalled = 0
+                    role_misses = dict.fromkeys(GUESS_ROLES, 0)
+                else:
+                    stalled += 1
+                    role_misses[role] += 1
+                history.append({**attempt, "ранг": rank, "лучший_до": best_before})
             elif word in game.unknown:
-                history.append({"слово": word, "связь": theme, "результат": "нет в словаре"})
+                history.append({**attempt, "результат": "нет в словаре"})
 
         best = ranked[0][1]
+        role_order = sorted(GUESS_ROLES, key=role_misses.__getitem__)
         if best <= 10:
             strategy = (
-                "Проверь ближайших соседей лидеров: точные синонимы, родовое или видовое слово "
-                "и характерные сочетания. Если прежние варианты не приблизили ответ, "
-                "проверь другое значение лидера или соседнюю часть речи."
+                "Сохрани сильнейшую подсказку, но ищи слово, которое объясняет её вместе "
+                "с ближайшим словом из другой группы. Не перечисляй подряд синонимы лидера."
             )
         elif retried or stalled >= STALL_ROUNDS:
             strategy = (
@@ -332,8 +351,8 @@ class ContextnoCodexMod(loader.Module):
             )
         else:
             strategy = (
-                "Начни со слова, которое объясняет несколько самых близких подсказок. "
-                "Если они неоднозначны, предложи запасные слова из других смысловых направлений."
+                "Сопоставь несколько ближайших подсказок с разными значениями. "
+                "Отдавай предпочтение устойчивым сочетаниям и конкретным понятиям."
             )
         data = {
             "ближайшие": ranked[:24],
@@ -341,6 +360,7 @@ class ContextnoCodexMod(loader.Module):
             "история_догадок_модуля": history[-12:],
             "попыток_без_улучшения": stalled,
             "стратегия": strategy,
+            "приоритет_ролей": role_order,
             "исключить": sorted(game.guesses.keys() | game.unknown | game.scores.keys()),
         }
         if retried:
@@ -359,7 +379,9 @@ class ContextnoCodexMod(loader.Module):
                 if self._rounds.get(key) is not game or not self._can_play(game):
                     return
                 excluded = game.guesses.keys() | game.unknown | game.scores.keys()
-                candidate = next((item for item in candidates if normalize(item[0]) not in excluded), None)
+                role_order = data["приоритет_ролей"]
+                available = (item for item in candidates if normalize(item[0]) not in excluded)
+                candidate = min(available, key=lambda item: role_order.index(item[2]), default=None)
                 if candidate is None:
                     if not retried:
                         retried = True
@@ -367,11 +389,11 @@ class ContextnoCodexMod(loader.Module):
                     game.last_error = "Codex дважды не предложил нового слова."
                     return
                 retried = False
-                guess, theme = candidate
+                guess, theme, role = candidate
                 normalized = normalize(guess)
                 game.pending = normalized
                 best_before = min(rank for _, rank in game.scores.values())
-                game.guesses[normalized] = (theme, best_before)
+                game.guesses[normalized] = (theme, role, best_before)
                 revision = game.latest_id
                 tag = REPLY_STYLE_TAGS[self.config["reply_style"]]
                 text = f"<{tag}>{guess}</{tag}>" if tag else guess
@@ -467,8 +489,11 @@ class ContextnoCodexMod(loader.Module):
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
-            word, theme = candidate.get("word"), candidate.get("theme")
-            if isinstance(word, str) and len(word) <= 40 and WORD_RE.fullmatch(word) and isinstance(theme, str):
-                suggestions.append((word, theme.strip()[:80]))
+            word, theme, role = candidate.get("word"), candidate.get("theme"), candidate.get("role")
+            if (
+                isinstance(word, str) and len(word) <= 40 and WORD_RE.fullmatch(word)
+                and isinstance(theme, str) and role in GUESS_ROLES
+            ):
+                suggestions.append((word, theme.strip()[:80], role))
         return suggestions
 
