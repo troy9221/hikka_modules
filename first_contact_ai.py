@@ -17,7 +17,7 @@ import aiohttp
 
 from .. import loader, utils
 
-__version__ = (1, 3, 2)
+__version__ = (1, 4, 0)
 
 logger = logging.getLogger(__name__)
 API_URL = "https://api.openai.com/v1/responses"
@@ -50,6 +50,20 @@ CODEX_ENV_KEYS = (
     "SYSTEMROOT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_CA_CERTIFICATE",
 )
+CODEX_MODELS_HELP = (
+    "auto — модель по умолчанию Codex CLI.\n"
+    "gpt-6-luna — быстрые короткие ответы.\n"
+    "gpt-6.1-terra — ответы с учётом нюансов.\n"
+    "gpt-6.1-sol, gpt-6-sol, gpt-6-astra — для более сложных диалогов.\n"
+    "Можно ввести другой ID. Доступные модели показывает /model в терминале Codex."
+)
+API_MODELS_HELP = (
+    "gpt-6-luna — быстрые короткие ответы.\n"
+    "gpt-6.1-terra — ответы с учётом нюансов.\n"
+    "gpt-6.1-sol, gpt-6-astra — для более сложных диалогов.\n"
+    "gpt-4.1-mini — прежняя модель, вывод из API запланирован на 14 января 2027 года.\n"
+    "Можно ввести другой ID модели Responses API, доступной вашему API-проекту."
+)
 
 
 class OpenAIError(Exception):
@@ -78,7 +92,11 @@ class FirstContactAIMod(loader.Module):
                 validator=loader.validators.Hidden(),
             ),
             loader.ConfigValue(
-                "model", "gpt-4.1-mini", "Модель для режима api. Режим codex выбирает модель CLI.",
+                "model", "gpt-6-luna", f"Только для режима api.\n\n{API_MODELS_HELP}",
+                validator=loader.validators.String(min_len=1),
+            ),
+            loader.ConfigValue(
+                "codex_model", "auto", f"Только для режима codex.\n\n{CODEX_MODELS_HELP}",
                 validator=loader.validators.String(min_len=1),
             ),
             loader.ConfigValue(
@@ -138,6 +156,8 @@ class FirstContactAIMod(loader.Module):
         if not executable:
             raise OpenAIError("Codex CLI не найден в PATH или ~/.local/bin пользователя Hikka. Проверьте установку или FIRSTCONTACT_CODEX_BIN.")
 
+        model = self.config["codex_model"].strip()
+        model_args = ["-m", model] if model and model != "auto" else []
         env = {key: os.environ[key] for key in CODEX_ENV_KEYS if key in os.environ}
         async with self._codex_slot:
             with tempfile.TemporaryDirectory(prefix="hikka-codex-") as cwd:
@@ -154,7 +174,7 @@ class FirstContactAIMod(loader.Module):
                 )
                 code, detail = await self._run_codex(
                     [
-                        executable, "-a", "never", "--disable", "shell_tool",
+                        executable, "-a", "never", *model_args, "--disable", "shell_tool",
                         "--disable", "apps", "--disable", "plugins",
                         "-c", 'web_search="disabled"', "-c", "agents.enabled=false",
                         "-c", "mcp_servers={}", "exec", "--ignore-user-config",
@@ -164,7 +184,16 @@ class FirstContactAIMod(loader.Module):
                     cwd, env, timeout=90, stdin=prompt.encode("utf-8"),
                 )
                 if code:
-                    if any(value in detail.lower() for value in ("usage limit", "rate limit", "429")):
+                    detail = detail.lower()
+                    if any(term in detail for term in (
+                        "model_not_found", "not supported when using codex", "unsupported model",
+                        "model is not available", "model is not supported", "invalid model",
+                    )):
+                        raise OpenAIError(
+                            "Выбранная модель недоступна в Codex. "
+                            "В .config FirstContactAI → codex_model выберите auto или модель из /model."
+                        )
+                    if any(value in detail for value in ("usage limit", "rate limit", "429")):
                         raise OpenAIError("Codex сообщил о лимите. Проверьте использование Codex в ChatGPT.")
                     raise OpenAIError(f"Codex CLI завершился с кодом {code}. Проверьте Codex от имени пользователя Hikka.")
                 try:
@@ -178,13 +207,19 @@ class FirstContactAIMod(loader.Module):
     async def _generate(self, key, messages, instructions, max_tokens):
         if self.config["backend"] == "codex":
             return await self._generate_codex(messages, instructions)
+        model = self.config["model"].strip()
         payload = {
-            "model": self.config["model"],
+            "model": model,
             "instructions": instructions,
             "input": messages,
             "max_output_tokens": max_tokens,
             "store": False,
         }
+        if model in {"gpt-6-luna", "gpt-6.1-terra"}:
+            payload["reasoning"] = {"effort": "none"}
+        elif model in {"gpt-6.1-sol", "gpt-6-astra"}:
+            payload["reasoning"] = {"effort": "low"}
+            payload["max_output_tokens"] = max_tokens + 1024
         clock = asyncio.get_running_loop().time
         try:
             async with self._api_slots:
@@ -219,7 +254,7 @@ class FirstContactAIMod(loader.Module):
 
     @loader.command()
     async def fcreply(self, message):
-        """<on|off|status|check|stop> — управление ИИ-автоответчиком."""
+        """<on|off|status|check|stop|models> — управление автоответчиком и справка по моделям."""
         action = utils.get_args_raw(message).strip().lower() or "status"
         backend = self.config["backend"]
         key = self._key() if backend == "api" else ""
@@ -228,6 +263,13 @@ class FirstContactAIMod(loader.Module):
             key_status = "задан" if key else "отсутствует"
             connection = f"Ключ OpenAI {key_status}." if backend == "api" else "Вход через Codex CLI."
             await utils.answer(message, f"Автоответчик {status}. {connection}")
+        elif action == "models":
+            await utils.answer(
+                message,
+                "Выбор модели в .config FirstContactAI.\n\n"
+                f"Codex CLI (codex_model)\n{CODEX_MODELS_HELP}\n\n"
+                f"OpenAI API (model)\n{API_MODELS_HELP}",
+            )
         elif action in {"on", "off"}:
             if action == "on" and backend == "api" and not key:
                 await utils.answer(message, "Укажите api_key в .config FirstContactAI.")
@@ -250,7 +292,7 @@ class FirstContactAIMod(loader.Module):
                 service = "Codex CLI" if backend == "codex" else "OpenAI API"
                 await utils.answer(message, f"{service} доступен. Тестовый ответ получен.")
         else:
-            await utils.answer(message, "Команды: .fcreply on / off / status / check. В личном чате: .fcreply stop.")
+            await utils.answer(message, "Команды: .fcreply on / off / status / check / models. В личном чате: .fcreply stop.")
 
     def _can_continue(self, chat_id, state, history):
         last_reply = state["last_reply"]
