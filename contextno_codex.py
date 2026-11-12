@@ -11,12 +11,13 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 6, 0)
+__version__ = (1, 6, 1)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
@@ -24,6 +25,7 @@ STALL_ROUNDS = 4
 GUESS_ROLES = ("bridge", "neighbor", "alternative")
 GROUP_PERMISSIONS = {"allow": "разрешено", "deny": "запрещено"}
 GROUPS_PER_PAGE = 5
+RECENT_GAME_WINDOW = timedelta(minutes=15)
 REPLY_STYLE_TAGS = {"italic": "i", "bold": "b", "plain": None}
 CODEX_MODELS_HELP = (
     "auto — модель по умолчанию Codex CLI.\n"
@@ -36,7 +38,7 @@ CODEX_MODELS_HELP = (
 WORD = r"[а-яё]+(?:-[а-яё]+)*"
 NUMBER = r"[0-9]+(?:[ \u00a0\u202f][0-9]{3})*"
 WORD_RE = re.compile(WORD)
-TOP_RE = re.compile(r"^\s*Топ ближайших слов:\s*$", re.I | re.M)
+TOP_RE = re.compile(r"^[^\w\n]*Топ(?:-\d+)? ближайших слов:[^\S\n]*$", re.I | re.M)
 ROW_RE = re.compile(rf"^[^\w\n]*({WORD})\s+\(({NUMBER})\)\s*$", re.I)
 SCORE_RE = re.compile(
     rf"^Слово:\s*({WORD})[^\n]*\n\s*Близость:\s*({NUMBER})\s*$", re.I | re.M
@@ -46,7 +48,7 @@ UNKNOWN_RE = re.compile(
 )
 NEW_RE = re.compile(r"^[^\w\n]*Новая игра начата\b", re.I)
 WIN_RE = re.compile(
-    r"\b(?:игра завершена|слово угадано|угадал[аи]?\s+(?:загаданное\s+)?слово"
+    r"\b(?:игра завершена|слово угадано|(?:у|от)гадал[аи]?\s+(?:загаданное\s+)?слово"
     r"|вы угадали)\b|\bугадал[аи]?\s*[:!]", re.I
 )
 ENV_KEYS = (
@@ -356,7 +358,10 @@ class ContextnoCodexMod(loader.Module):
             self._set_group_rule(group_id, permission, title)
             if permission == "clear":
                 return f"{label}. Группа удалена из списка, автоподбор выключен."
-            return f"{label}. Во всех темах {GROUP_PERMISSIONS[permission]}."
+            result = f"{label}. Во всех темах {GROUP_PERMISSIONS[permission]}."
+            if permission == "allow":
+                result += f" {await self._resume_game(message)}"
+            return result
         rule = self._group_rule(group_id)
         policy = f"Во всех темах {GROUP_PERMISSIONS[rule[0]]}." if rule else "Правила для группы пока нет."
         return f"{label}. {policy}"
@@ -384,13 +389,13 @@ class ContextnoCodexMod(loader.Module):
             if rule:
                 result += f" {escape(rule[1])} (<code>{group_id}</code>) — {GROUP_PERMISSIONS[rule[0]]}."
             result += f" Порог входа: топ-{self.config['start_rank']}."
+            if self._is_enabled(key):
+                result += f" {self._game_status(game)}"
             if game and game.best:
                 result += f" Лучшее место в топе: {game.best}. Попыток: {len(game.guesses)}."
                 if game.last_guess_score:
                     word, rank = game.last_guess_score
                     result += f" Последняя оценённая догадка: {word} ({rank})."
-                if game.closed:
-                    result += " Раунд завершён."
                 if game.last_error:
                     result += f" Последняя ошибка: {game.last_error}"
         elif action == "models":
@@ -418,12 +423,56 @@ class ContextnoCodexMod(loader.Module):
         key = chat_key(message)
         if not self._is_enabled(key):
             return
-        sender = getattr(message, "sender", None) or await message.get_sender()
-        if not getattr(sender, "bot", False) or (getattr(sender, "username", None) or "").lower() != BOT:
-            return
-        if not self._is_enabled(key):
-            return
+        if await self._is_game_bot(message) and self._is_enabled(key):
+            self._observe_game(key, message, live=True)
 
+    async def _is_game_bot(self, message):
+        sender = getattr(message, "sender", None) or await message.get_sender()
+        return getattr(sender, "bot", False) and (getattr(sender, "username", None) or "").lower() == BOT
+
+    def _queue_guess(self, key, game):
+        if game and not game.worker and self._is_enabled(key) and self._can_play(game):
+            game.worker = asyncio.create_task(self._play(key, game))
+
+    def _game_status(self, game):
+        if game and game.worker:
+            return "Codex подбирает слово."
+        if game and game.closed:
+            return "Раунд завершён. Жду следующего."
+        if not game or not game.best:
+            return "Жду сообщение игрового бота с топом ближайших слов."
+        if game.best > self.config["start_rank"]:
+            return f"Лучшее место {game.best}. Для входа нужно {self.config['start_rank']} или ближе."
+        if game.pending:
+            return "Жду оценку отправленного слова."
+        return "Готов к следующему игровому сообщению."
+
+    async def _resume_game(self, message):
+        key = chat_key(message)
+        game = self._rounds.get(key)
+        if game and game.worker:
+            return self._game_status(game)
+        cutoff = datetime.now(timezone.utc) - RECENT_GAME_WINDOW
+        recent = []
+        try:
+            async for item in self._client.iter_messages(message.chat_id, from_user=BOT, limit=30):
+                if item.date < cutoff:
+                    break
+                if chat_key(item) == key and await self._is_game_bot(item):
+                    recent.append(item)
+        except Exception:
+            logger.warning("ContextnoCodex: не удалось прочитать историю игрового бота", exc_info=True)
+            return "Не удалось прочитать историю игры. Жду новое сообщение с топом."
+        if not self._is_enabled(key):
+            return "Автоподбор выключен."
+        for item in reversed(recent):
+            self._observe_game(key, item, live=False)
+        game = self._rounds.get(key)
+        if game and not game.pending and any(item.id == game.latest_id for item in recent):
+            self._queue_guess(key, game)
+        return self._game_status(game)
+
+    def _observe_game(self, key, message, live):
         game = self._rounds.setdefault(key, Round())
         if game.latest_bot_message is None or message.id > game.latest_bot_message.id:
             game.latest_bot_message = message
@@ -480,12 +529,8 @@ class ContextnoCodexMod(loader.Module):
             game.pending = ""
             feedback = True
         game.latest_id = message.id
-        if (
-            self._can_play(game)
-            and (top or feedback)
-            and not game.worker
-        ):
-            game.worker = asyncio.create_task(self._play(key, game))
+        if live and (top or feedback):
+            self._queue_guess(key, game)
 
     def _guess_context(self, game, retried):
         ranked = sorted(game.scores.values(), key=lambda item: item[1])
