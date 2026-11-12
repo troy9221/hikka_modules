@@ -17,13 +17,14 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 6, 2)
+__version__ = (1, 6, 3)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
 STALL_ROUNDS = 4
 GUESS_ROLES = ("bridge", "neighbor", "alternative")
 EXPLORATION_RANK = 1000
+CLOSE_RANK = 100
 GUESS_DOMAINS = (
     "люди и отношения", "дом и повседневные вещи", "природа и животные",
     "места и движение", "работа и общество", "техника и материалы",
@@ -75,8 +76,9 @@ OUTPUT_SCHEMA = {
                     "theme": {"type": "string"},
                     "role": {"type": "string", "enum": list(GUESS_ROLES)},
                     "domain": {"type": "string", "enum": list(GUESS_DOMAINS)},
+                    "anchors": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["word", "theme", "role", "domain"],
+                "required": ["word", "theme", "role", "domain", "anchors"],
                 "additionalProperties": False,
             },
         },
@@ -104,6 +106,8 @@ PROMPT = (
     "Выбирай обычные общеупотребительные слова, исключай имена, жаргон и редкие термины. "
     "theme — название проверяемой смысловой связи в 2–5 словах. "
     "domain — основная смысловая область предложенного слова. "
+    "anchors — проверенные слова из списка опор, с которыми у кандидата есть "
+    "прямая смысловая связь или естественное словосочетание. Если списка опор нет, верни пустой массив. "
     "Исключи уже проверенные слова и их грамматические формы."
 )
 logger = logging.getLogger(__name__)
@@ -569,6 +573,8 @@ class ContextnoCodexMod(loader.Module):
         best = ranked[0][1]
         role_order = sorted(GUESS_ROLES, key=role_misses.__getitem__)
         preferred_domains = []
+        anchors = []
+        required_anchor = None
         if best > EXPLORATION_RANK:
             if stalled == 0 and history and history[-1].get("ранг") == best and not retried:
                 strategy = (
@@ -586,10 +592,19 @@ class ContextnoCodexMod(loader.Module):
                     "из новой области, которое лучше всего проверяет одну из слабых подсказок. "
                     "При сомнении используй широкое понятие вместо узкой детали."
                 )
-        elif best <= 10:
+        elif best <= CLOSE_RANK:
+            anchors = [(word, rank) for word, rank in ranked[:8] if rank <= best * 6]
+            if len(ranked) == 1 or ranked[1][1] >= best * 3:
+                required_anchor = ranked[0][0]
+            role_order = list(GUESS_ROLES)
             strategy = (
-                "Сохрани сильнейшую подсказку, но ищи слово, которое объясняет её вместе "
-                "с ближайшим словом из другой группы. Не перечисляй подряд синонимы лидера."
+                "Ответ близко. Для каждого кандидата назови его прямые связи с опорными словами. "
+                "Если задана обязательная опора, каждый кандидат должен прямо с ней сочетаться. "
+                "В theme дай естественное словосочетание с опорой. "
+                "Меняй связь внутри подтверждённой темы: состав, применение, результат, упаковка, "
+                "состояние или форма. Отдавай приоритет обычным словам с несколькими связями. "
+                "Промахи исключают конкретную ассоциацию, но не отменяют сильного лидера. "
+                "Не опирайся только на более далёкие подсказки."
             )
         elif retried or stalled >= STALL_ROUNDS:
             strategy = (
@@ -609,14 +624,36 @@ class ContextnoCodexMod(loader.Module):
             "стратегия": strategy,
             "приоритет_ролей": role_order,
             "предпочтительные_области": preferred_domains,
+            "опорные_слова": anchors,
+            "обязательная_опора": required_anchor,
             "исключить": sorted(game.guesses.keys() | game.unknown | game.scores.keys()),
         }
         if retried:
-            data["повторный_подбор"] = "Предыдущий ответ не содержал новых слов."
+            data["повторный_подбор"] = "Нужны новые варианты, которые удовлетворяют требованиям к опорам."
         recheck = stalled > 0 and stalled % STALL_ROUNDS == 0
         first_probe = best > EXPLORATION_RANK and not any(domain_probes.values())
-        effort = "medium" if retried or best <= 10 or recheck or first_probe else "low"
+        effort = "medium" if retried or anchors or recheck or first_probe else "low"
         return data, effort
+
+    def _select_guess(self, candidates, excluded, data):
+        role_order = data["приоритет_ролей"]
+        preferred_domains = data["предпочтительные_области"]
+        available = [item for item in candidates if normalize(item[0]) not in excluded]
+        anchors = {normalize(word): rank for word, rank in data["опорные_слова"]}
+        if anchors:
+            required = normalize(data["обязательная_опора"] or "")
+            supported = []
+            for item in available:
+                matches = item[4] & anchors.keys()
+                if matches and (not required or required in matches):
+                    weight = sum(1 / anchors[word] for word in sorted(matches))
+                    supported.append((weight, item))
+            return max(supported, key=lambda pair: (pair[0], -role_order.index(pair[1][2])), default=(0, None))[1]
+        return min(
+            available,
+            key=lambda item: (bool(preferred_domains and item[3] not in preferred_domains), role_order.index(item[2])),
+            default=None,
+        )
 
     async def _play(self, key, game):
         retried = False
@@ -628,22 +665,15 @@ class ContextnoCodexMod(loader.Module):
                 if self._rounds.get(key) is not game or not self._is_enabled(key) or not self._can_play(game):
                     return
                 excluded = game.guesses.keys() | game.unknown | game.scores.keys()
-                role_order = data["приоритет_ролей"]
-                preferred_domains = data["предпочтительные_области"]
-                available = (item for item in candidates if normalize(item[0]) not in excluded)
-                candidate = min(
-                    available,
-                    key=lambda item: (bool(preferred_domains and item[3] not in preferred_domains), role_order.index(item[2])),
-                    default=None,
-                )
+                candidate = self._select_guess(candidates, excluded, data)
                 if candidate is None:
                     if not retried:
                         retried = True
                         continue
-                    game.last_error = "Codex дважды не предложил нового слова."
+                    game.last_error = "Codex дважды не предложил подходящего нового слова."
                     return
                 retried = False
-                guess, theme, role, domain = candidate
+                guess, theme, role, domain, _ = candidate
                 normalized = normalize(guess)
                 game.pending = normalized
                 best_before = min(rank for _, rank in game.scores.values())
@@ -745,10 +775,13 @@ class ContextnoCodexMod(loader.Module):
                 continue
             word, theme, role = candidate.get("word"), candidate.get("theme"), candidate.get("role")
             domain = candidate.get("domain")
+            anchors = candidate.get("anchors")
             if (
                 isinstance(word, str) and len(word) <= 40 and WORD_RE.fullmatch(word)
                 and isinstance(theme, str) and role in GUESS_ROLES and domain in GUESS_DOMAINS
+                and isinstance(anchors, list)
             ):
-                suggestions.append((word, theme.strip()[:80], role, domain))
+                anchor_words = {normalize(item) for item in anchors if isinstance(item, str) and WORD_RE.fullmatch(item)}
+                suggestions.append((word, theme.strip()[:80], role, domain, anchor_words))
         return suggestions
 
