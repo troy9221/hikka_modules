@@ -16,13 +16,14 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 5, 0)
+__version__ = (1, 6, 0)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
 STALL_ROUNDS = 4
 GUESS_ROLES = ("bridge", "neighbor", "alternative")
 GROUP_PERMISSIONS = {"allow": "разрешено", "deny": "запрещено"}
+GROUPS_PER_PAGE = 5
 REPLY_STYLE_TAGS = {"italic": "i", "bold": "b", "plain": None}
 CODEX_MODELS_HELP = (
     "auto — модель по умолчанию Codex CLI.\n"
@@ -171,6 +172,7 @@ class ContextnoCodexMod(loader.Module):
 
     def __init__(self):
         self._rounds = {}
+        self._config_hook = None
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
                 "codex_bin", "", "Путь к Codex CLI. По умолчанию используется FIRSTCONTACT_CODEX_BIN, PATH или ~/.local/bin.",
@@ -193,7 +195,9 @@ class ContextnoCodexMod(loader.Module):
             ),
             loader.ConfigValue(
                 "group_rules", [],
-                "Правила для всех тем группы. Добавляйте по одному в формате "
+                "Список групп с кнопками включения, отключения и удаления. "
+                "Выполните .contextno on в группе, чтобы добавить её. "
+                "При ручном вводе используйте формат "
                 "ID | allow или deny | Название группы. Например, -1001234567890 | allow | Контекстно с друзьями. "
                 "Для одного ID действует последнее правило. Команда .contextno group показывает ID текущей группы.",
                 validator=loader.validators.Series(
@@ -209,8 +213,15 @@ class ContextnoCodexMod(loader.Module):
             if self.config["codex_model"] == "gpt-5.4-mini":
                 self.config["codex_model"] = "auto"
             self.set("codex_model_migrated", True)
+        self._attach_group_settings()
+        await self._migrate_enabled_groups()
 
     async def on_unload(self):
+        if self._config_hook:
+            configurator, original, wrapper = self._config_hook
+            if configurator.inline__configure_option is wrapper:
+                configurator.inline__configure_option = original
+            self._config_hook = None
         for game in self._rounds.values():
             if game.worker:
                 game.worker.cancel()
@@ -228,7 +239,44 @@ class ContextnoCodexMod(loader.Module):
 
     def _is_enabled(self, key):
         rule = self._group_rule(key.split(":", 1)[0])
-        return rule[0] == "allow" if rule else key in self.get("enabled", [])
+        return bool(rule and rule[0] == "allow")
+
+    def _attach_group_settings(self):
+        configurator = self.lookup("HikkaConfig")
+        original = getattr(configurator, "inline__configure_option", None)
+        if self._config_hook or not callable(original):
+            return
+
+        # Hikka's standard config has no per-option renderer hook.
+        async def configure_option(call, mod, config_opt, force_hidden=False, obj_type=False):
+            if self._config_hook and config_opt == "group_rules" and self.lookup(mod) is self:
+                return await self._show_groups(call, back=(mod, obj_type))
+            return await original(call, mod, config_opt, force_hidden, obj_type)
+
+        self._config_hook = (configurator, original, configure_option)
+        configurator.inline__configure_option = configure_option
+
+    async def _migrate_enabled_groups(self):
+        legacy = self.get("enabled", [])
+        if not legacy:
+            return
+        rules = list(self.config["group_rules"])
+        group_ids = dict.fromkeys(key.split(":", 1)[0] for key in legacy)
+        for group_id in group_ids:
+            if not re.fullmatch(r"-[1-9][0-9]*", group_id) or self._group_rule(group_id):
+                continue
+            title = f"Группа {group_id}"
+            try:
+                chat = await self._client.get_entity(int(group_id))
+            except Exception:
+                logger.debug("ContextnoCodex: не удалось получить название группы %s", group_id)
+            else:
+                if getattr(chat, "broadcast", False):
+                    continue
+                title = getattr(chat, "title", None) or title
+            rules.append(f"{group_id} | allow | {title}")
+        self.config["group_rules"] = rules
+        self.set("enabled", [])
 
     def _prune_disabled_rounds(self):
         for key in list(self._rounds):
@@ -238,10 +286,62 @@ class ContextnoCodexMod(loader.Module):
                     game.worker.cancel()
 
     def _set_group_rule(self, group_id, permission, title=""):
-        rules = [rule for rule in self.config["group_rules"] if rule.split(" | ", 1)[0] != group_id]
+        rules = {rule.split(" | ", 1)[0]: rule for rule in self.config["group_rules"]}
         if permission in GROUP_PERMISSIONS:
-            rules.append(f"{group_id} | {permission} | {title}")
-        self.config["group_rules"] = rules
+            rules[group_id] = f"{group_id} | {permission} | {title}"
+        else:
+            rules.pop(group_id, None)
+        self.config["group_rules"] = list(rules.values())
+
+    async def _show_groups(self, call, page=0, back=None):
+        rules = {}
+        for rule in self.config["group_rules"]:
+            group_id, permission, title = rule.split(" | ", 2)
+            rules[group_id] = (permission, title)
+        pages = max(1, (len(rules) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        start = page * GROUPS_PER_PAGE
+        rows = list(rules.items())[start:start + GROUPS_PER_PAGE]
+        lines = ["<b>Группы ContextnoCodex</b>", ""]
+        buttons = []
+        for index, (group_id, (permission, title)) in enumerate(rows, start + 1):
+            enabled = permission == "allow"
+            status = "включено" if enabled else "выключено"
+            lines.append(f"{index}. <b>{escape(title)}</b> · {status} · <code>{group_id}</code>")
+            buttons.append([
+                {
+                    "text": f"{'Отключить' if enabled else 'Включить'} №{index}",
+                    "callback": self._change_group,
+                    "args": (group_id, "deny" if enabled else "allow", page, back),
+                },
+                {"text": f"Удалить №{index}", "callback": self._change_group, "args": (group_id, "clear", page, back)},
+            ])
+        if not rows:
+            lines.append("Список пуст. Выполни <code>.contextno on</code> в нужной группе.")
+        if pages > 1:
+            lines.append(f"\nСтраница {page + 1} из {pages}")
+            buttons.append([
+                {"text": label, "callback": self._show_groups, "args": (target, back)}
+                for label, target in (("⬅️", page - 1), ("➡️", page + 1))
+                if 0 <= target < pages
+            ])
+        if back and self._config_hook:
+            mod, obj_type = back
+            configurator, original, _ = self._config_hook
+            buttons.append([
+                {"text": "Добавить по ID", "callback": original, "args": (mod, "group_rules"), "kwargs": {"obj_type": obj_type}},
+            ])
+            buttons.append([
+                {"text": "Назад в настройки", "callback": configurator.inline__configure, "args": (mod,), "kwargs": {"obj_type": obj_type}},
+            ])
+        buttons.append([{"text": "Закрыть", "action": "close"}])
+        await call.edit("\n".join(lines), reply_markup=buttons)
+
+    async def _change_group(self, call, group_id, permission, page, back):
+        rule = self._group_rule(group_id)
+        if rule and permission != rule[0]:
+            self._set_group_rule(group_id, permission, rule[1])
+        await self._show_groups(call, page, back)
 
     async def _group_command(self, message, permission):
         if not message.is_group:
@@ -255,7 +355,7 @@ class ContextnoCodexMod(loader.Module):
         if permission:
             self._set_group_rule(group_id, permission, title)
             if permission == "clear":
-                return f"{label}. Правило удалено. Действуют настройки чата или темы."
+                return f"{label}. Группа удалена из списка, автоподбор выключен."
             return f"{label}. Во всех темах {GROUP_PERMISSIONS[permission]}."
         rule = self._group_rule(group_id)
         policy = f"Во всех темах {GROUP_PERMISSIONS[rule[0]]}." if rule else "Правила для группы пока нет."
@@ -268,26 +368,13 @@ class ContextnoCodexMod(loader.Module):
         key = chat_key(message)
         group_id = key.split(":", 1)[0]
         if action in {"on", "off"}:
-            rule = self._group_rule(group_id)
-            if rule:
-                permission = "allow" if action == "on" else "deny"
-                self._set_group_rule(group_id, permission, rule[1])
-                result = f"{escape(rule[1])}. Во всех темах {GROUP_PERMISSIONS[permission]}."
-            else:
-                enabled = set(self.get("enabled", []))
-                if action == "on":
-                    enabled.add(key)
-                else:
-                    enabled.discard(key)
-                self.set("enabled", sorted(enabled))
-                self._prune_disabled_rounds()
-                result = "Автоподбор включён." if action == "on" else "Автоподбор выключен."
+            result = await self._group_command(message, "allow" if action == "on" else "deny")
         elif action == "groups":
-            rules = {}
-            for rule in self.config["group_rules"]:
-                saved_id, permission, title = rule.split(" | ", 2)
-                rules[saved_id] = f"{escape(title)} (<code>{saved_id}</code>) — {GROUP_PERMISSIONS[permission]}"
-            result = "\n".join(rules.values()) or "Правил пока нет. Открой .config ContextnoCodex → group_rules."
+            form = await self.inline.form("Группы ContextnoCodex", message=message, silent=True)
+            if form:
+                await self._show_groups(form)
+                return
+            result = "Открой .config ContextnoCodex → group_rules."
         elif action == "group" or action.startswith("group "):
             result = await self._group_command(message, action[5:].strip())
         elif action == "status":
