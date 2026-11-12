@@ -17,12 +17,18 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 6, 1)
+__version__ = (1, 6, 2)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
 STALL_ROUNDS = 4
 GUESS_ROLES = ("bridge", "neighbor", "alternative")
+EXPLORATION_RANK = 1000
+GUESS_DOMAINS = (
+    "люди и отношения", "дом и повседневные вещи", "природа и животные",
+    "места и движение", "работа и общество", "техника и материалы",
+    "действия и процессы", "качества и состояния",
+)
 GROUP_PERMISSIONS = {"allow": "разрешено", "deny": "запрещено"}
 GROUPS_PER_PAGE = 5
 RECENT_GAME_WINDOW = timedelta(minutes=15)
@@ -68,8 +74,9 @@ OUTPUT_SCHEMA = {
                     "word": {"type": "string"},
                     "theme": {"type": "string"},
                     "role": {"type": "string", "enum": list(GUESS_ROLES)},
+                    "domain": {"type": "string", "enum": list(GUESS_DOMAINS)},
                 },
-                "required": ["word", "theme", "role"],
+                "required": ["word", "theme", "role", "domain"],
                 "additionalProperties": False,
             },
         },
@@ -94,7 +101,9 @@ PROMPT = (
     "alternative — другое значение, участник или условие ситуации, которое ещё не проверяли. "
     "Все три слова должны проверять разные связи. Следуй стратегии текущего хода. "
     "word — одно слово кириллицей, строчными буквами, в начальной форме. "
+    "Выбирай обычные общеупотребительные слова, исключай имена, жаргон и редкие термины. "
     "theme — название проверяемой смысловой связи в 2–5 словах. "
+    "domain — основная смысловая область предложенного слова. "
     "Исключи уже проверенные слова и их грамматические формы."
 )
 logger = logging.getLogger(__name__)
@@ -393,6 +402,8 @@ class ContextnoCodexMod(loader.Module):
                 result += f" {self._game_status(game)}"
             if game and game.best:
                 result += f" Лучшее место в топе: {game.best}. Попыток: {len(game.guesses)}."
+                if self._can_play(game) and min(rank for _, rank in game.scores.values()) > EXPLORATION_RANK:
+                    result += " Режим: широкий поиск по разным областям."
                 if game.last_guess_score:
                     word, rank = game.last_guess_score
                     result += f" Последняя оценённая догадка: {word} ({rank})."
@@ -406,7 +417,7 @@ class ContextnoCodexMod(loader.Module):
                 loop = asyncio.get_running_loop()
                 started = loop.time()
                 candidates = await self._suggest({"ближайшие": [["орден", 450], ["медаль", 2200]]})
-                word = next((w for w, _, _ in candidates if normalize(w) not in {"орден", "медаль"}), "")
+                word = next((item[0] for item in candidates if normalize(item[0]) not in {"орден", "медаль"}), "")
                 elapsed = loop.time() - started
                 result = (
                     f"Codex CLI ответил за {elapsed:.1f} с. Пример слова: {word}."
@@ -537,12 +548,15 @@ class ContextnoCodexMod(loader.Module):
         history = []
         stalled = 0
         role_misses = dict.fromkeys(GUESS_ROLES, 0)
-        for word, (theme, role, best_before) in game.guesses.items():
-            attempt = {"слово": word, "связь": theme, "роль": role}
+        domain_probes = dict.fromkeys(GUESS_DOMAINS, 0)
+        for word, (theme, role, domain, best_before) in game.guesses.items():
+            attempt = {"слово": word, "связь": theme, "роль": role, "область": domain}
             score = game.scores.get(word)
             if score:
                 _, rank = score
-                if rank < best_before:
+                if best_before > EXPLORATION_RANK:
+                    domain_probes[domain] += 1
+                if rank < best_before and (best_before <= EXPLORATION_RANK or rank * 4 <= best_before * 3):
                     stalled = 0
                     role_misses = dict.fromkeys(GUESS_ROLES, 0)
                 else:
@@ -554,7 +568,25 @@ class ContextnoCodexMod(loader.Module):
 
         best = ranked[0][1]
         role_order = sorted(GUESS_ROLES, key=role_misses.__getitem__)
-        if best <= 10:
+        preferred_domains = []
+        if best > EXPLORATION_RANK:
+            if stalled == 0 and history and history[-1].get("ранг") == best and not retried:
+                strategy = (
+                    "Последняя догадка заметно улучшила ранг. Проверь одно распространённое "
+                    "слово из найденного направления. Два запасных возьми из других областей."
+                )
+            else:
+                least_tested = min(domain_probes.values())
+                preferred_domains = [domain for domain in GUESS_DOMAINS if domain_probes[domain] == least_tested]
+                role_order = ["alternative", "bridge", "neighbor"]
+                strategy = (
+                    "Ранги выше 1000 дают слабый сигнал. Проверь разные смысловые области, "
+                    "а не синонимы и однокоренные слова одного лидера. Выбери три разных области "
+                    "из предпочтительных. Для alternative предложи обычное конкретное слово "
+                    "из новой области, которое лучше всего проверяет одну из слабых подсказок. "
+                    "При сомнении используй широкое понятие вместо узкой детали."
+                )
+        elif best <= 10:
             strategy = (
                 "Сохрани сильнейшую подсказку, но ищи слово, которое объясняет её вместе "
                 "с ближайшим словом из другой группы. Не перечисляй подряд синонимы лидера."
@@ -576,12 +608,14 @@ class ContextnoCodexMod(loader.Module):
             "попыток_без_улучшения": stalled,
             "стратегия": strategy,
             "приоритет_ролей": role_order,
+            "предпочтительные_области": preferred_domains,
             "исключить": sorted(game.guesses.keys() | game.unknown | game.scores.keys()),
         }
         if retried:
             data["повторный_подбор"] = "Предыдущий ответ не содержал новых слов."
         recheck = stalled > 0 and stalled % STALL_ROUNDS == 0
-        effort = "medium" if retried or best <= 10 or recheck else "low"
+        first_probe = best > EXPLORATION_RANK and not any(domain_probes.values())
+        effort = "medium" if retried or best <= 10 or recheck or first_probe else "low"
         return data, effort
 
     async def _play(self, key, game):
@@ -595,8 +629,13 @@ class ContextnoCodexMod(loader.Module):
                     return
                 excluded = game.guesses.keys() | game.unknown | game.scores.keys()
                 role_order = data["приоритет_ролей"]
+                preferred_domains = data["предпочтительные_области"]
                 available = (item for item in candidates if normalize(item[0]) not in excluded)
-                candidate = min(available, key=lambda item: role_order.index(item[2]), default=None)
+                candidate = min(
+                    available,
+                    key=lambda item: (bool(preferred_domains and item[3] not in preferred_domains), role_order.index(item[2])),
+                    default=None,
+                )
                 if candidate is None:
                     if not retried:
                         retried = True
@@ -604,11 +643,11 @@ class ContextnoCodexMod(loader.Module):
                     game.last_error = "Codex дважды не предложил нового слова."
                     return
                 retried = False
-                guess, theme, role = candidate
+                guess, theme, role, domain = candidate
                 normalized = normalize(guess)
                 game.pending = normalized
                 best_before = min(rank for _, rank in game.scores.values())
-                game.guesses[normalized] = (theme, role, best_before)
+                game.guesses[normalized] = (theme, role, domain, best_before)
                 revision = game.latest_id
                 tag = REPLY_STYLE_TAGS[self.config["reply_style"]]
                 text = f"<{tag}>{guess}</{tag}>" if tag else guess
@@ -705,10 +744,11 @@ class ContextnoCodexMod(loader.Module):
             if not isinstance(candidate, dict):
                 continue
             word, theme, role = candidate.get("word"), candidate.get("theme"), candidate.get("role")
+            domain = candidate.get("domain")
             if (
                 isinstance(word, str) and len(word) <= 40 and WORD_RE.fullmatch(word)
-                and isinstance(theme, str) and role in GUESS_ROLES
+                and isinstance(theme, str) and role in GUESS_ROLES and domain in GUESS_DOMAINS
             ):
-                suggestions.append((word, theme.strip()[:80], role))
+                suggestions.append((word, theme.strip()[:80], role, domain))
         return suggestions
 
