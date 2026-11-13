@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -17,7 +18,7 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 6, 3)
+__version__ = (1, 7, 0)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
@@ -32,6 +33,8 @@ GUESS_DOMAINS = (
 )
 GROUP_PERMISSIONS = {"allow": "разрешено", "deny": "запрещено"}
 GROUPS_PER_PAGE = 5
+PLAY_TIME_UNITS = {"d": 86400, "h": 3600, "m": 60}
+PLAY_TIME_TOKEN = re.compile(r"([0-9]{1,6})\s*([dhm])")
 RECENT_GAME_WINDOW = timedelta(minutes=15)
 REPLY_STYLE_TAGS = {"italic": "i", "bold": "b", "plain": None}
 CODEX_MODELS_HELP = (
@@ -164,6 +167,28 @@ def validate_group_rule(value):
     raise loader.validators.ValidationError("Введите отрицательный ID | allow или deny | Название группы.")
 
 
+def parse_play_duration(value):
+    seconds = 0
+    remaining = value.strip()
+    while remaining:
+        match = PLAY_TIME_TOKEN.match(remaining)
+        if not match:
+            raise ValueError("Укажи время в формате 1d, 1h 1m или 30m.")
+        amount, unit = match.groups()
+        seconds += int(amount) * PLAY_TIME_UNITS[unit]
+        remaining = remaining[match.end():].lstrip()
+    if not seconds:
+        raise ValueError("Укажи время больше нуля, например 1m.")
+    return seconds
+
+
+def format_play_duration(seconds):
+    minutes = (max(0, seconds) + 59) // 60
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    return " ".join(f"{value}{unit}" for value, unit in ((days, "d"), (hours, "h"), (minutes, "m")) if value) or "0m"
+
+
 @dataclass
 class Round:
     latest_id: int = 0
@@ -187,6 +212,7 @@ class ContextnoCodexMod(loader.Module):
 
     def __init__(self):
         self._rounds = {}
+        self._play_timers = {}
         self._config_hook = None
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
@@ -211,14 +237,14 @@ class ContextnoCodexMod(loader.Module):
             loader.ConfigValue(
                 "group_rules", [],
                 "Список групп с кнопками включения, отключения и удаления. "
-                "Выполните .contextno on в группе, чтобы добавить её. "
+                "Выполните .contextno on в группе, чтобы добавить её, или .contextno on 1h 1m для игры по таймеру. "
                 "При ручном вводе используйте формат "
                 "ID | allow или deny | Название группы. Например, -1001234567890 | allow | Контекстно с друзьями. "
                 "Для одного ID действует последнее правило. Команда .contextno group показывает ID текущей группы.",
                 validator=loader.validators.Series(
                     loader.validators.Validator(validate_group_rule, "строкой ID | allow или deny | Название группы"),
                 ),
-                on_change=self._prune_disabled_rounds,
+                on_change=self._group_rules_changed,
             ),
         )
         self._codex_lock = asyncio.Lock()
@@ -230,8 +256,14 @@ class ContextnoCodexMod(loader.Module):
             self.set("codex_model_migrated", True)
         self._attach_group_settings()
         await self._migrate_enabled_groups()
+        self._group_rules_changed()
+        for group_id in self.get("play_deadlines", {}):
+            self._arm_play_timer(group_id)
 
     async def on_unload(self):
+        for timer in self._play_timers.values():
+            timer.cancel()
+        self._play_timers.clear()
         if self._config_hook:
             configurator, original, wrapper = self._config_hook
             if configurator.inline__configure_option is wrapper:
@@ -253,8 +285,55 @@ class ContextnoCodexMod(loader.Module):
         return None
 
     def _is_enabled(self, key):
-        rule = self._group_rule(key.split(":", 1)[0])
-        return bool(rule and rule[0] == "allow")
+        group_id = key.split(":", 1)[0]
+        rule = self._group_rule(group_id)
+        deadline = self.get("play_deadlines", {}).get(group_id)
+        return bool(rule and rule[0] == "allow" and (deadline is None or deadline > time.time()))
+
+    def _set_play_deadline(self, group_id, deadline=None):
+        deadlines = dict(self.get("play_deadlines", {}))
+        if deadline is None and group_id not in deadlines:
+            return
+        if deadline is None:
+            deadlines.pop(group_id)
+        else:
+            deadlines[group_id] = deadline
+        self.set("play_deadlines", deadlines)
+        self._arm_play_timer(group_id)
+
+    def _arm_play_timer(self, group_id):
+        timer = self._play_timers.pop(group_id, None)
+        if timer:
+            timer.cancel()
+        deadline = self.get("play_deadlines", {}).get(group_id)
+        if deadline is not None:
+            loop = asyncio.get_running_loop()
+            self._play_timers[group_id] = loop.call_later(
+                max(0, deadline - time.time()), self._expire_play_timer, group_id, deadline,
+            )
+
+    def _expire_play_timer(self, group_id, deadline):
+        if self.get("play_deadlines", {}).get(group_id) != deadline:
+            return
+        if deadline > time.time():
+            self._arm_play_timer(group_id)
+            return
+        rule = self._group_rule(group_id)
+        if rule and rule[0] == "allow":
+            self._set_group_rule(group_id, "deny", rule[1])
+        else:
+            self._set_play_deadline(group_id)
+
+    def _group_rules_changed(self):
+        self._prune_disabled_rounds()
+        for group_id in self.get("play_deadlines", {}):
+            rule = self._group_rule(group_id)
+            if not rule or rule[0] != "allow":
+                self._set_play_deadline(group_id)
+
+    def _time_left(self, group_id):
+        deadline = self.get("play_deadlines", {}).get(group_id)
+        return format_play_duration(deadline - int(time.time())) if deadline is not None else ""
 
     def _attach_group_settings(self):
         configurator = self.lookup("HikkaConfig")
@@ -300,13 +379,14 @@ class ContextnoCodexMod(loader.Module):
                 if game.worker:
                     game.worker.cancel()
 
-    def _set_group_rule(self, group_id, permission, title=""):
+    def _set_group_rule(self, group_id, permission, title="", duration=None):
         rules = {rule.split(" | ", 1)[0]: rule for rule in self.config["group_rules"]}
         if permission in GROUP_PERMISSIONS:
             rules[group_id] = f"{group_id} | {permission} | {title}"
         else:
             rules.pop(group_id, None)
         self.config["group_rules"] = list(rules.values())
+        self._set_play_deadline(group_id, int(time.time()) + duration if duration is not None else None)
 
     async def _show_groups(self, call, page=0, back=None):
         rules = {}
@@ -320,8 +400,11 @@ class ContextnoCodexMod(loader.Module):
         lines = ["<b>Группы ContextnoCodex</b>", ""]
         buttons = []
         for index, (group_id, (permission, title)) in enumerate(rows, start + 1):
-            enabled = permission == "allow"
+            enabled = self._is_enabled(group_id)
             status = "включено" if enabled else "выключено"
+            remaining = self._time_left(group_id) if enabled else ""
+            if remaining:
+                status += f", осталось {remaining}"
             lines.append(f"{index}. <b>{escape(title)}</b> · {status} · <code>{group_id}</code>")
             buttons.append([
                 {
@@ -354,11 +437,11 @@ class ContextnoCodexMod(loader.Module):
 
     async def _change_group(self, call, group_id, permission, page, back):
         rule = self._group_rule(group_id)
-        if rule and permission != rule[0]:
+        if rule and (permission != "allow" or not self._is_enabled(group_id)):
             self._set_group_rule(group_id, permission, rule[1])
         await self._show_groups(call, page, back)
 
-    async def _group_command(self, message, permission):
+    async def _group_command(self, message, permission, duration=None):
         if not message.is_group:
             return "Выполни .contextno group в группе, чтобы узнать её ID и название."
         if permission not in {"", "allow", "deny", "clear"}:
@@ -368,25 +451,37 @@ class ContextnoCodexMod(loader.Module):
         title = " ".join((getattr(chat, "title", None) or f"Группа {group_id}").split())
         label = f"{escape(title)} (<code>{group_id}</code>)"
         if permission:
-            self._set_group_rule(group_id, permission, title)
+            self._set_group_rule(group_id, permission, title, duration)
             if permission == "clear":
                 return f"{label}. Группа удалена из списка, автоподбор выключен."
             result = f"{label}. Во всех темах {GROUP_PERMISSIONS[permission]}."
             if permission == "allow":
+                result += f" На {format_play_duration(duration)}." if duration is not None else " Без ограничения по времени."
                 result += f" {await self._resume_game(message)}"
             return result
         rule = self._group_rule(group_id)
-        policy = f"Во всех темах {GROUP_PERMISSIONS[rule[0]]}." if rule else "Правила для группы пока нет."
+        policy = (
+            f"Во всех темах {GROUP_PERMISSIONS['allow' if self._is_enabled(group_id) else 'deny']}."
+            if rule else "Правила для группы пока нет."
+        )
         return f"{label}. {policy}"
 
     @loader.command()
     async def contextno(self, message):
-        """<on|off|status|check|models|groups|group> — управление автоподбором и правилами групп."""
+        """on [1d 1h 1m] | off | status | check | models | groups | group — управление автоподбором."""
         action = utils.get_args_raw(message).strip().lower() or "status"
         key = chat_key(message)
         group_id = key.split(":", 1)[0]
-        if action in {"on", "off"}:
-            result = await self._group_command(message, "allow" if action == "on" else "deny")
+        verb, _, argument = action.partition(" ")
+        if verb == "on":
+            try:
+                duration = parse_play_duration(argument) if argument.strip() else None
+            except ValueError as exc:
+                result = str(exc)
+            else:
+                result = await self._group_command(message, "allow", duration)
+        elif action == "off":
+            result = await self._group_command(message, "deny")
         elif action == "groups":
             form = await self.inline.form("Группы ContextnoCodex", message=message, silent=True)
             if form:
@@ -400,9 +495,12 @@ class ContextnoCodexMod(loader.Module):
             result = "Автоподбор включён." if self._is_enabled(key) else "Автоподбор выключен."
             rule = self._group_rule(group_id)
             if rule:
-                result += f" {escape(rule[1])} (<code>{group_id}</code>) — {GROUP_PERMISSIONS[rule[0]]}."
+                permission = "allow" if self._is_enabled(key) else "deny"
+                result += f" {escape(rule[1])} (<code>{group_id}</code>) — {GROUP_PERMISSIONS[permission]}."
             result += f" Порог входа: топ-{self.config['start_rank']}."
             if self._is_enabled(key):
+                remaining = self._time_left(group_id)
+                result += f" Осталось {remaining}." if remaining else " Без ограничения по времени."
                 result += f" {self._game_status(game)}"
             if game and game.best:
                 result += f" Лучшее место в топе: {game.best}. Попыток: {len(game.guesses)}."
