@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 7, 1)
+__version__ = (1, 7, 2)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
@@ -463,9 +463,12 @@ class ContextnoCodexMod(loader.Module):
 
     async def _change_group(self, call, group_id, permission, page, back):
         rule = self._group_rule(group_id)
+        notice = ""
         if rule and (permission != "allow" or not self._is_enabled(group_id)):
             self._set_group_rule(group_id, permission, rule[1])
-        await self._show_groups(call, page, back)
+            if permission == "allow":
+                notice = await self._resume_game(int(group_id))
+        await self._show_groups(call, page, back, escape(notice))
 
     async def _group_command(self, message, permission, duration=None):
         if not message.is_group:
@@ -535,8 +538,6 @@ class ContextnoCodexMod(loader.Module):
                 if game.last_guess_score:
                     word, rank = game.last_guess_score
                     result += f" Последняя оценённая догадка: {word} ({rank})."
-                if game.last_error:
-                    result += f" Последняя ошибка: {game.last_error}"
         elif action == "models":
             result = f"Выбор модели в .config ContextnoCodex → codex_model.\n\n{CODEX_MODELS_HELP}"
         elif action == "check":
@@ -584,6 +585,8 @@ class ContextnoCodexMod(loader.Module):
             return f"Лучшее место {game.best}. Для входа нужно {self.config['start_rank']} или ближе."
         if game.pending:
             return "Жду оценку отправленного слова."
+        if game.last_error:
+            return f"Последняя ошибка: {game.last_error}"
         return "Готов к следующему игровому сообщению."
 
     async def _resume_game(self, chat_id, key=None):
@@ -641,6 +644,8 @@ class ContextnoCodexMod(loader.Module):
             return
 
         latest_score = ranked_word(score) if score else None
+        if latest_score and latest_score[1] < 1:
+            latest_score = None
         ranks = top + ([latest_score] if latest_score else [])
         if latest_score and normalize(latest_score[0]) in game.guesses:
             game.last_guess_score = latest_score
@@ -659,11 +664,13 @@ class ContextnoCodexMod(loader.Module):
                 return
             game.pending = ""
             feedback = True
-        elif top:
-            game.best = min(rank for _, rank in top)
-        elif not score:
+        elif not ranks:
             return
 
+        if ranks:
+            game.best = min(rank for _, rank in ranks)
+            if not top and game.scores:
+                game.best = min(game.best, min(rank for _, rank in game.scores.values()))
         for word, rank in top:
             game.scores[normalize(word)] = (word, rank)
         if latest_score:
@@ -676,7 +683,7 @@ class ContextnoCodexMod(loader.Module):
             game.pending = ""
             feedback = True
         game.latest_id = message.id
-        if live and (top or feedback):
+        if live and (ranks or feedback):
             self._queue_guess(key, game)
 
     def _guess_context(self, game, retried):
