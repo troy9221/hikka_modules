@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 7, 0)
+__version__ = (1, 7, 1)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
@@ -237,7 +237,7 @@ class ContextnoCodexMod(loader.Module):
             loader.ConfigValue(
                 "group_rules", [],
                 "Список групп с кнопками включения, отключения и удаления. "
-                "Выполните .contextno on в группе, чтобы добавить её, или .contextno on 1h 1m для игры по таймеру. "
+                "Кнопка «Таймер» включает группу на заданное время, например 1h 1m или 1d. "
                 "При ручном вводе используйте формат "
                 "ID | allow или deny | Название группы. Например, -1001234567890 | allow | Контекстно с друзьями. "
                 "Для одного ID действует последнее правило. Команда .contextno group показывает ID текущей группы.",
@@ -388,7 +388,7 @@ class ContextnoCodexMod(loader.Module):
         self.config["group_rules"] = list(rules.values())
         self._set_play_deadline(group_id, int(time.time()) + duration if duration is not None else None)
 
-    async def _show_groups(self, call, page=0, back=None):
+    async def _show_groups(self, call, page=0, back=None, notice=""):
         rules = {}
         for rule in self.config["group_rules"]:
             group_id, permission, title = rule.split(" | ", 2)
@@ -399,7 +399,7 @@ class ContextnoCodexMod(loader.Module):
         rows = list(rules.items())[start:start + GROUPS_PER_PAGE]
         lines = ["<b>Группы ContextnoCodex</b>", ""]
         buttons = []
-        for index, (group_id, (permission, title)) in enumerate(rows, start + 1):
+        for index, (group_id, (_, title)) in enumerate(rows, start + 1):
             enabled = self._is_enabled(group_id)
             status = "включено" if enabled else "выключено"
             remaining = self._time_left(group_id) if enabled else ""
@@ -412,10 +412,16 @@ class ContextnoCodexMod(loader.Module):
                     "callback": self._change_group,
                     "args": (group_id, "deny" if enabled else "allow", page, back),
                 },
+                {
+                    "text": f"Таймер №{index}",
+                    "input": "Время игры, например 1h 1m, 30m или 1d",
+                    "handler": self._set_group_timer_from_menu,
+                    "args": (group_id, page, back, call.inline_message_id),
+                },
                 {"text": f"Удалить №{index}", "callback": self._change_group, "args": (group_id, "clear", page, back)},
             ])
         if not rows:
-            lines.append("Список пуст. Выполни <code>.contextno on</code> в нужной группе.")
+            lines.append("Список пуст. Добавь группу по ID через настройки.")
         if pages > 1:
             lines.append(f"\nСтраница {page + 1} из {pages}")
             buttons.append([
@@ -433,7 +439,27 @@ class ContextnoCodexMod(loader.Module):
                 {"text": "Назад в настройки", "callback": configurator.inline__configure, "args": (mod,), "kwargs": {"obj_type": obj_type}},
             ])
         buttons.append([{"text": "Закрыть", "action": "close"}])
+        if notice:
+            lines.extend(("", notice))
         await call.edit("\n".join(lines), reply_markup=buttons)
+
+    async def _set_group_timer_from_menu(self, call, query, group_id, page, back, inline_message_id):
+        # The chosen inline result belongs to the input message, so edit the original menu.
+        call.inline_message_id = inline_message_id
+        rule = self._group_rule(group_id)
+        if not rule:
+            notice = "Группа удалена из списка."
+        else:
+            try:
+                duration = parse_play_duration(query.lower())
+            except ValueError as exc:
+                notice = str(exc)
+            else:
+                self._set_group_rule(group_id, "allow", rule[1], duration)
+                notice = f"Таймер установлен на {format_play_duration(duration)}."
+                status = await self._resume_game(int(group_id))
+                notice += f" {status}"
+        await self._show_groups(call, page, back, escape(notice))
 
     async def _change_group(self, call, group_id, permission, page, back):
         rule = self._group_rule(group_id)
@@ -457,7 +483,7 @@ class ContextnoCodexMod(loader.Module):
             result = f"{label}. Во всех темах {GROUP_PERMISSIONS[permission]}."
             if permission == "allow":
                 result += f" На {format_play_duration(duration)}." if duration is not None else " Без ограничения по времени."
-                result += f" {await self._resume_game(message)}"
+                result += f" {await self._resume_game(message.chat_id, chat_key(message))}"
             return result
         rule = self._group_rule(group_id)
         policy = (
@@ -560,24 +586,32 @@ class ContextnoCodexMod(loader.Module):
             return "Жду оценку отправленного слова."
         return "Готов к следующему игровому сообщению."
 
-    async def _resume_game(self, message):
-        key = chat_key(message)
+    async def _resume_game(self, chat_id, key=None):
         game = self._rounds.get(key)
         if game and game.worker:
             return self._game_status(game)
         cutoff = datetime.now(timezone.utc) - RECENT_GAME_WINDOW
         recent = []
         try:
-            async for item in self._client.iter_messages(message.chat_id, from_user=BOT, limit=30):
+            async for item in self._client.iter_messages(chat_id, from_user=BOT, limit=30):
                 if item.date < cutoff:
                     break
-                if chat_key(item) == key and await self._is_game_bot(item):
+                if (key is None or chat_key(item) == key) and await self._is_game_bot(item):
                     recent.append(item)
         except Exception:
             logger.warning("ContextnoCodex: не удалось прочитать историю игрового бота", exc_info=True)
             return "Не удалось прочитать историю игры. Жду новое сообщение с топом."
-        if not self._is_enabled(key):
+        if not self._is_enabled(str(chat_id)):
             return "Автоподбор выключен."
+        if key is None:
+            for item in recent:
+                text = (item.raw_text or "").strip()
+                if parse_top(text) or SCORE_RE.search(text) or NEW_RE.match(text) or WIN_RE.search(text):
+                    key = chat_key(item)
+                    break
+            if key is None:
+                return self._game_status(None)
+            recent = [item for item in recent if chat_key(item) == key]
         for item in reversed(recent):
             self._observe_game(key, item, live=False)
         game = self._rounds.get(key)
