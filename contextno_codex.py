@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 8, 0)
+__version__ = (1, 8, 1)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
@@ -368,17 +368,25 @@ class ContextnoCodexMod(loader.Module):
             timer.cancel()
         window = self.get("play_windows", {}).get(group_id)
         if window and self._is_armed(group_id):
-            _, delay = play_window_state(window, time.time())
+            now = time.time()
+            _, delay = play_window_state(window, now)
             self._window_timers[group_id] = asyncio.get_running_loop().call_later(
-                delay, self._on_window_boundary, group_id,
+                delay, self._on_window_boundary, group_id, now + delay,
             )
 
-    def _on_window_boundary(self, group_id):
+    def _on_window_boundary(self, group_id, boundary):
+        remaining = boundary - time.time()
+        if remaining > 0:
+            # Some event loops run scheduled callbacks slightly before their deadline.
+            self._window_timers[group_id] = asyncio.get_running_loop().call_later(
+                remaining + 0.02, self._on_window_boundary, group_id, boundary,
+            )
+            return
         self._arm_window(group_id)
         if not self._is_enabled(group_id):
             self._prune_disabled_rounds()
             return
-        task = asyncio.create_task(self._resume_game(int(group_id)))
+        task = asyncio.create_task(self._resume_group(int(group_id)))
         self._window_tasks.add(task)
         task.add_done_callback(self._window_tasks.discard)
 
