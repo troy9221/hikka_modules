@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .. import loader, utils
 
-__version__ = (1, 7, 3)
+__version__ = (1, 7, 4)
 
 BOT = "contextno_rf_bot"
 CODEX_TIMEOUTS = {"low": 30, "medium": 55}
@@ -34,7 +34,9 @@ GUESS_DOMAINS = (
 GROUP_PERMISSIONS = {"allow": "разрешено", "deny": "запрещено"}
 GROUPS_PER_PAGE = 5
 PLAY_TIME_UNITS = {"d": 86400, "h": 3600, "m": 60}
-PLAY_TIME_TOKEN = re.compile(r"([0-9]{1,6})\s*([dhm])")
+PLAY_TIME_TOKEN = re.compile(
+    r"([0-9]{1,6})\s*(день|дня|дней|часов|часа|час|минуты|минута|минут|[dhmдчм])\s*"
+)
 RECENT_GAME_WINDOW = timedelta(minutes=15)
 REPLY_STYLE_TAGS = {"italic": "i", "bold": "b", "plain": None}
 CODEX_MODELS_HELP = (
@@ -108,6 +110,7 @@ PROMPT = (
     "neighbor — точное соседнее понятие сильнейшей подсказки. "
     "alternative — другое значение, участник или условие ситуации, которое ещё не проверяли. "
     "Все три слова должны проверять разные связи. Следуй стратегии текущего хода. "
+    "Упорядочь кандидатов: первым поставь наиболее полезный следующий ход с учётом фактических рангов. "
     "word — одно слово кириллицей, строчными буквами, в начальной форме. "
     "Выбирай обычные общеупотребительные слова, исключай имена, жаргон и редкие термины. "
     "При равных вариантах выбирай существительное в именительном падеже. "
@@ -167,19 +170,20 @@ def validate_group_rule(value):
         group_id, permission, title = parts
         permission = permission.lower()
         title = " ".join(title.split())
-        if re.fullmatch(r"-[1-9][0-9]*", group_id) and permission in GROUP_PERMISSIONS and title:
+        if re.fullmatch(r"-[1-9][0-9]*", group_id) and re.fullmatch(r"allow(?:@\d{1,12})?|deny", permission) and title:
             return f"{group_id} | {permission} | {title}"
     raise loader.validators.ValidationError("Введите отрицательный ID | allow или deny | Название группы.")
 
 
 def parse_play_duration(value):
     seconds = 0
-    remaining = value.strip()
+    remaining = value.strip().lower()
     while remaining:
         match = PLAY_TIME_TOKEN.match(remaining)
         if not match:
-            raise ValueError("Укажи время в формате 1d, 1h 1m или 30m.")
+            raise ValueError("Время не изменено. Введи, например, 2h, 2 часа или 30m.")
         amount, unit = match.groups()
+        unit = {"д": "d", "ч": "h", "м": "m"}.get(unit[0], unit[0])
         seconds += int(amount) * PLAY_TIME_UNITS[unit]
         remaining = remaining[match.end():].lstrip()
     if not seconds:
@@ -242,8 +246,8 @@ class ContextnoCodexMod(loader.Module):
             ),
             loader.ConfigValue(
                 "probe_moves", 1,
-                "Сколько первых оценённых автоходов в раунде отвести на проверку гипотез. "
-                "0 — сразу искать наиболее вероятный ответ.",
+                "Сколько первых оценённых автоходов при слабых подсказках отвести на проверку гипотез. "
+                "При месте 1000 или ближе бот сразу развивает сильную подсказку. 0 — без пробных ходов.",
                 validator=loader.validators.Integer(minimum=0, maximum=5),
             ),
             loader.ConfigValue(
@@ -268,9 +272,18 @@ class ContextnoCodexMod(loader.Module):
             self.set("codex_model_migrated", True)
         self._attach_group_settings()
         await self._migrate_enabled_groups()
+        legacy = self.get("play_deadlines", {})
+        if legacy:
+            rules = []
+            for rule in self.config["group_rules"]:
+                group_id, permission, title = rule.split(" | ", 2)
+                if permission == "allow" and group_id in legacy:
+                    rule = f"{group_id} | allow@{legacy[group_id]} | {title}"
+                rules.append(rule)
+            self.config["group_rules"] = rules
+            self._save_group_rules()
+            self.set("play_deadlines", {})
         self._group_rules_changed()
-        for group_id in self.get("play_deadlines", {}):
-            self._arm_play_timer(group_id)
 
     async def on_unload(self):
         for timer in self._play_timers.values():
@@ -293,58 +306,41 @@ class ContextnoCodexMod(loader.Module):
         for rule in reversed(self.config["group_rules"]):
             saved_id, permission, title = rule.split(" | ", 2)
             if saved_id == group_id:
-                return permission, title
+                mode, _, deadline = permission.partition("@")
+                return mode, title, int(deadline) if deadline else None
         return None
 
     def _is_enabled(self, key):
         group_id = key.split(":", 1)[0]
         rule = self._group_rule(group_id)
-        deadline = self.get("play_deadlines", {}).get(group_id)
-        return bool(rule and rule[0] == "allow" and (deadline is None or deadline > time.time()))
-
-    def _set_play_deadline(self, group_id, deadline=None):
-        deadlines = dict(self.get("play_deadlines", {}))
-        if deadline is None and group_id not in deadlines:
-            return
-        if deadline is None:
-            deadlines.pop(group_id)
-        else:
-            deadlines[group_id] = deadline
-        self.set("play_deadlines", deadlines)
-        self._arm_play_timer(group_id)
-
-    def _arm_play_timer(self, group_id):
-        timer = self._play_timers.pop(group_id, None)
-        if timer:
-            timer.cancel()
-        deadline = self.get("play_deadlines", {}).get(group_id)
-        if deadline is not None:
-            loop = asyncio.get_running_loop()
-            self._play_timers[group_id] = loop.call_later(
-                max(0, deadline - time.time()), self._expire_play_timer, group_id, deadline,
-            )
+        return bool(rule and rule[0] == "allow" and (rule[2] is None or rule[2] > time.time()))
 
     def _expire_play_timer(self, group_id, deadline):
-        if self.get("play_deadlines", {}).get(group_id) != deadline:
+        rule = self._group_rule(group_id)
+        if not rule or rule[2] != deadline:
             return
         if deadline > time.time():
-            self._arm_play_timer(group_id)
+            self._group_rules_changed()
             return
-        rule = self._group_rule(group_id)
-        if rule and rule[0] == "allow":
-            self._set_group_rule(group_id, "deny", rule[1])
-        else:
-            self._set_play_deadline(group_id)
+        self._set_group_rule(group_id, "deny", rule[1])
 
     def _group_rules_changed(self):
         self._prune_disabled_rounds()
-        for group_id in self.get("play_deadlines", {}):
-            rule = self._group_rule(group_id)
-            if not rule or rule[0] != "allow":
-                self._set_play_deadline(group_id)
+        for timer in self._play_timers.values():
+            timer.cancel()
+        self._play_timers.clear()
+        loop = asyncio.get_running_loop()
+        group_ids = {rule.split(" | ", 1)[0] for rule in self.config["group_rules"]}
+        for group_id in group_ids:
+            _, _, deadline = self._group_rule(group_id)
+            if deadline is not None:
+                self._play_timers[group_id] = loop.call_later(
+                    max(0, deadline - time.time()), self._expire_play_timer, group_id, deadline,
+                )
 
     def _time_left(self, group_id):
-        deadline = self.get("play_deadlines", {}).get(group_id)
+        rule = self._group_rule(group_id)
+        deadline = rule[2] if rule else None
         return format_play_duration(deadline - int(time.time())) if deadline is not None else ""
 
     def _attach_group_settings(self):
@@ -393,12 +389,24 @@ class ContextnoCodexMod(loader.Module):
 
     def _set_group_rule(self, group_id, permission, title="", duration=None):
         rules = {rule.split(" | ", 1)[0]: rule for rule in self.config["group_rules"]}
-        if permission in GROUP_PERMISSIONS:
+        current = self._group_rule(group_id)
+        if permission == "allow":
+            if duration is not None:
+                permission = f"allow@{int(time.time()) + duration}"
+            elif current and current[2] and self._is_enabled(group_id):
+                permission = f"allow@{current[2]}"
+        if permission != "clear":
             rules[group_id] = f"{group_id} | {permission} | {title}"
         else:
             rules.pop(group_id, None)
         self.config["group_rules"] = list(rules.values())
-        self._set_play_deadline(group_id, int(time.time()) + duration if duration is not None else None)
+        self._save_group_rules()
+
+    def _save_group_rules(self):
+        # Flush the rule and its deadline together before a reload can restore the old rule.
+        config = dict(self.get("__config__", {}))
+        config["group_rules"] = self.config["group_rules"]
+        self.set("__config__", config)
 
     async def _show_groups(self, call, page=0, back=None, notice=""):
         rules = {}
@@ -426,7 +434,7 @@ class ContextnoCodexMod(loader.Module):
                 },
                 {
                     "text": f"Таймер №{index}",
-                    "input": "Время игры, например 1h 1m, 30m или 1d",
+                    "input": "Время игры, например 2 часа, 1h 1m или 1d",
                     "handler": self._set_group_timer_from_menu,
                     "args": (group_id, page, back, call.inline_message_id),
                 },
@@ -497,7 +505,8 @@ class ContextnoCodexMod(loader.Module):
                 return f"{label}. Группа удалена из списка, автоподбор выключен."
             result = f"{label}. Во всех темах {GROUP_PERMISSIONS[permission]}."
             if permission == "allow":
-                result += f" На {format_play_duration(duration)}." if duration is not None else " Без ограничения по времени."
+                remaining = self._time_left(group_id)
+                result += f" Осталось {remaining}." if remaining else " Без ограничения по времени."
                 result += f" {await self._resume_game(message.chat_id, chat_key(message))}"
             return result
         rule = self._group_rule(group_id)
@@ -728,7 +737,7 @@ class ContextnoCodexMod(loader.Module):
                 history.append({**attempt, "результат": "нет в словаре"})
 
         best = ranked[0][1]
-        probing = evaluated < self.config["probe_moves"]
+        probing = best > EXPLORATION_RANK and evaluated < self.config["probe_moves"]
         role_order = sorted(GUESS_ROLES, key=role_misses.__getitem__)
         preferred_domains = []
         anchors = []
@@ -796,7 +805,7 @@ class ContextnoCodexMod(loader.Module):
             "исключить": sorted(game.guesses.keys() | game.unknown | game.duplicates | game.scores.keys()),
         }
         if retried:
-            data["повторный_подбор"] = "Нужны новые варианты, которые удовлетворяют требованиям к опорам."
+            data["повторный_подбор"] = "Предложи другие слова и соблюдай требования к опорам, если они заданы."
         recheck = stalled > 0 and stalled % STALL_ROUNDS == 0
         first_probe = best > EXPLORATION_RANK and not any(domain_probes.values())
         effort = "medium" if retried or probing or anchors or recheck or first_probe else "low"
@@ -806,18 +815,16 @@ class ContextnoCodexMod(loader.Module):
         role_order = data["приоритет_ролей"]
         preferred_domains = data["предпочтительные_области"]
         available = [item for item in candidates if normalize(item[0]) not in excluded]
-        if data["пробный_ход"]:
-            return next((item for item in available if item[2] == "alternative"), None)
         anchors = {normalize(word): rank for word, rank in data["опорные_слова"]}
         if anchors:
             required = normalize(data["обязательная_опора"] or "")
-            supported = []
             for item in available:
                 matches = item[4] & anchors.keys()
                 if matches and (not required or required in matches):
-                    weight = sum(1 / anchors[word] for word in sorted(matches))
-                    supported.append((weight, item))
-            return max(supported, key=lambda pair: (pair[0], -role_order.index(pair[1][2])), default=(0, None))[1]
+                    return item
+            return None
+        if not preferred_domains:
+            return next(iter(available), None)
         return min(
             available,
             key=lambda item: (bool(preferred_domains and item[3] not in preferred_domains), role_order.index(item[2])),
